@@ -59,6 +59,10 @@ impl MapActivation {
     pub fn is_empty(&self) -> bool {
         self.bindings.is_empty()
     }
+
+    pub(super) fn values(&self) -> impl Iterator<Item = &Value> {
+        self.bindings.values()
+    }
 }
 
 impl Activation for MapActivation {

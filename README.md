@@ -4,7 +4,7 @@ A Rust implementation of the [Common Expression Language](https://github.com/goo
 
 This repository is a fork of [ponix-dev/cel-core](https://github.com/ponix-dev/cel-core), created by Simon Rall and the upstream contributors. It starts from upstream **0.5.1** ([77277ec](https://github.com/ponix-dev/cel-core/commit/77277ec6a336646d946ee549a5012116378b82e4)). We retain their MIT/Apache-2.0 licensing and notices. Thank you to the original authors for the parser, checker, evaluator and protobuf interoperability this work builds on.
 
-The inherited pipeline includes parsing, type checking, evaluation and protobuf AST conversion for interoperation with [cel-go](https://github.com/google/cel-go) and [cel-cpp](https://github.com/google/cel-cpp). This fork is being evaluated and hardened for server-side use; **full CEL conformance and safe execution of untrusted expressions are not yet established**. Source compilation has depth and size ceilings; known gaps still include native evaluation/allocation budgets, dynamic type inference and runtime error positions.
+The inherited pipeline includes parsing, type checking, evaluation and protobuf AST conversion for interoperation with [cel-go](https://github.com/google/cel-go) and [cel-cpp](https://github.com/google/cel-cpp). This fork is being evaluated and hardened for server-side use; **full CEL conformance and safe execution of untrusted expressions are not yet established**. Source compilation has depth and size ceilings, and native evaluation has an opt-in logical resource meter. Known gaps still include cost-model calibration, dynamic type inference and ordinary runtime error positions.
 
 The [guard-index example](crates/cel-core/examples/guard_index/README.md) explores conservative candidate selection followed by complete CEL evaluation. It is an experiment, not a production matcher.
 
@@ -144,7 +144,7 @@ let env = Env::with_standard_library()
 
 Source parsing rejects inputs over 100,000 bytes, parser nesting over 64 expression levels, and expanded trees over 10,000 nodes or depth 128 (a leaf has depth one). Macro-generated nodes and cloned subtree occurrences count toward the tree limits. Limit failures return positioned parse errors without a partial AST. These are library ceilings, not Ryusen's final manifest policy or hard limits on peak compilation memory. Custom macro callbacks are trusted code and must bound their own work; externally constructed or protobuf-imported ASTs bypass source parsing.
 
-Ordinary evaluation errors are returned as `Value::Error`, including through logical operators. Parsing limits are not a runtime sandbox: execution still needs fuel and allocation limits before accepting arbitrary untrusted expressions and activations.
+Ordinary evaluation errors are returned as `Value::Error`, subject to CEL's logical error suppression. The existing `eval` API is unbounded. Parsing limits alone are not a runtime sandbox.
 
 ```rust
 let result = program.eval(&activation);
@@ -153,6 +153,33 @@ match &result {
     value => println!("result: {}", value),
 }
 ```
+
+### Native evaluation limits
+
+Use `Program::eval_with_limits(&MapActivation, EvalLimits)` to opt into one shared fuel and cumulative allocation meter. Child scopes and nested macros consume the same allowance. Ordinary CEL errors remain `Ok(Value::Error(..))`; resource refusals are fatal `Err(EvalLimitError)` values with UTF-8 byte spans and cannot be suppressed by `|| true`, `has()` or macros. Short-circuited branches are not evaluated.
+
+```rust
+use cel_core::{Env, EvalLimits, MapActivation, Value};
+
+let env = Env::with_standard_library();
+let program = env.program(&env.compile("[1, 2, 3].all(x, x > 0)")?)?;
+let result = program.eval_with_limits(
+    &MapActivation::new(),
+    EvalLimits { fuel: 100_000, allocation_bytes: 1_000_000 },
+)?;
+assert_eq!(result, Value::Bool(true));
+```
+
+| Boundary | Current contract |
+|---|---|
+| Native values | Borrowed inputs and every expression result are structurally validated; maximum depth 64, including scalar leaves. Shared subtrees count by occurrence. Scalar invariants are not comprehensively validated. |
+| Native work | Nodes, validation, iterations, lookups, comparisons, copies, conversions and string/regex work are charged. |
+| Allocation | Conservative logical bytes, cumulative rather than live memory; temporary drops do not refund the allowance. |
+| Regex | Bounded mode caps compiled state and DFA cache at 64 KiB each; a compiled-state refusal is fatal. |
+| Host operations | Custom/lazy activations are not accepted. Function callbacks, extensions, protobuf registries/construction and message values are refused before execution. |
+| Outside the meter | Input preparation, existing input/program storage and fixed evaluator setup; externally constructed/imported ASTs are not validated by this API. Use source-compiled ASTs. |
+
+This is **not an allocator/RSS cap, a wall-clock deadline or a complete sandbox**. The initial schedule is deliberately conservative and uncalibrated: it reserves 4 KiB per expression, 8 KiB per comprehension iteration, and additional variable-size work/copy allowances. Traversing intermediate collections can itself be quadratic, so this API makes no throughput claim. Costs are not a stable ABI; callers must choose policy limits and bound input preparation separately. Ordinary CEL errors still lack source positions, and the inherited conformance harness primarily exercises the unbounded API.
 
 > See the [examples](crates/cel-core/examples/) directory for more usage patterns including lists, maps, timestamps/durations, and error handling. For proto-related examples (enums, namespaces), see [cel-core-proto/examples](crates/cel-core-proto/examples/).
 

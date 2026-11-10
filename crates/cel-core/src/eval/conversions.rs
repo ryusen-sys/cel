@@ -55,10 +55,7 @@ impl<'a> Evaluator<'a> {
                 .unwrap_or_else(|_| Value::error(EvalError::invalid_conversion("string", "int"))),
             Value::Timestamp(t) => Value::Int(t.seconds),
             Value::Enum(e) => Value::Int(e.value as i64),
-            _ => Value::error(EvalError::invalid_conversion(
-                &value.cel_type().display_name(),
-                "int",
-            )),
+            _ => self.type_error(value, |actual| EvalError::invalid_conversion(actual, "int")),
         }
     }
 
@@ -83,10 +80,9 @@ impl<'a> Evaluator<'a> {
                 .parse::<u64>()
                 .map(Value::UInt)
                 .unwrap_or_else(|_| Value::error(EvalError::invalid_conversion("string", "uint"))),
-            _ => Value::error(EvalError::invalid_conversion(
-                &value.cel_type().display_name(),
-                "uint",
-            )),
+            _ => self.type_error(value, |actual| {
+                EvalError::invalid_conversion(actual, "uint")
+            }),
         }
     }
 
@@ -98,10 +94,9 @@ impl<'a> Evaluator<'a> {
             Value::String(s) => s.parse::<f64>().map(Value::Double).unwrap_or_else(|_| {
                 Value::error(EvalError::invalid_conversion("string", "double"))
             }),
-            _ => Value::error(EvalError::invalid_conversion(
-                &value.cel_type().display_name(),
-                "double",
-            )),
+            _ => self.type_error(value, |actual| {
+                EvalError::invalid_conversion(actual, "double")
+            }),
         }
     }
 
@@ -124,10 +119,9 @@ impl<'a> Evaluator<'a> {
                 // Format as CEL duration string
                 Value::String(Arc::from(time::format_duration(d)))
             }
-            _ => Value::error(EvalError::invalid_conversion(
-                &value.cel_type().display_name(),
-                "string",
-            )),
+            _ => self.type_error(value, |actual| {
+                EvalError::invalid_conversion(actual, "string")
+            }),
         }
     }
 
@@ -135,10 +129,9 @@ impl<'a> Evaluator<'a> {
         match value {
             Value::Bytes(b) => Value::Bytes(b.clone()),
             Value::String(s) => Value::Bytes(Arc::from(s.as_bytes())),
-            _ => Value::error(EvalError::invalid_conversion(
-                &value.cel_type().display_name(),
-                "bytes",
-            )),
+            _ => self.type_error(value, |actual| {
+                EvalError::invalid_conversion(actual, "bytes")
+            }),
         }
     }
 
@@ -150,10 +143,9 @@ impl<'a> Evaluator<'a> {
                 "false" | "False" | "FALSE" | "f" | "0" => Value::Bool(false),
                 _ => Value::error(EvalError::invalid_conversion("string", "bool")),
             },
-            _ => Value::error(EvalError::invalid_conversion(
-                &value.cel_type().display_name(),
-                "bool",
-            )),
+            _ => self.type_error(value, |actual| {
+                EvalError::invalid_conversion(actual, "bool")
+            }),
         }
     }
 
@@ -174,10 +166,9 @@ impl<'a> Evaluator<'a> {
                     ))
                 }
             }
-            _ => Value::error(EvalError::invalid_conversion(
-                &value.cel_type().display_name(),
-                "timestamp",
-            )),
+            _ => self.type_error(value, |actual| {
+                EvalError::invalid_conversion(actual, "timestamp")
+            }),
         }
     }
 
@@ -198,10 +189,9 @@ impl<'a> Evaluator<'a> {
                     ))
                 }
             }
-            _ => Value::error(EvalError::invalid_conversion(
-                &value.cel_type().display_name(),
-                "duration",
-            )),
+            _ => self.type_error(value, |actual| {
+                EvalError::invalid_conversion(actual, "duration")
+            }),
         }
     }
 }

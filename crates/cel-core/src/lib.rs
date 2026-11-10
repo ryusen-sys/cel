@@ -59,8 +59,8 @@ pub use checker::{CheckError, CheckErrorKind, CheckResult, ReferenceInfo};
 // Re-export from eval module
 pub use eval::time;
 pub use eval::{
-    Activation, EmptyActivation, EvalError, EvalErrorKind, HierarchicalActivation, MapActivation,
-    Program, Value, ValueError,
+    Activation, EmptyActivation, EvalError, EvalErrorKind, EvalLimitError, EvalLimitKind,
+    EvalLimits, HierarchicalActivation, MapActivation, Program, Value, ValueError,
 };
 pub use eval::{
     Duration, EnumValue, MapKey, OptionalValue, SharedActivation, Timestamp, TypeValue, ValueMap,

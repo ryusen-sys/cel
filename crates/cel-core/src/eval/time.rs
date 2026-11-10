@@ -43,6 +43,7 @@ pub fn parse_timestamp(s: &str) -> Result<Timestamp, String> {
 /// - "100ns" - 100 nanoseconds
 /// - "-30s" - negative 30 seconds
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
+    const OUT_OF_RANGE: &str = "duration out of range: must be within approximately 10000 years";
     if s.is_empty() {
         return Err("empty duration string".to_string());
     }
@@ -103,31 +104,32 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
         };
 
         // Parse the number (may be floating point)
-        if num_str.contains('.') {
+        let nanos = if num_str.contains('.') {
             let num: f64 = num_str
                 .parse()
                 .map_err(|_| format!("invalid number in duration: '{}'", num_str))?;
-            total_nanos += (num * multiplier as f64) as i128;
+            (num * multiplier as f64) as i128
         } else {
             let num: i128 = num_str
                 .parse()
                 .map_err(|_| format!("invalid number in duration: '{}'", num_str))?;
-            total_nanos += num * multiplier;
-        }
+            num.checked_mul(multiplier).ok_or(OUT_OF_RANGE)?
+        };
+        total_nanos = total_nanos.checked_add(nanos).ok_or(OUT_OF_RANGE)?;
     }
 
     if negative {
-        total_nanos = -total_nanos;
+        total_nanos = total_nanos.checked_neg().ok_or(OUT_OF_RANGE)?;
     }
 
     // Convert to seconds and nanos
-    let seconds = (total_nanos / 1_000_000_000) as i64;
+    let seconds = i64::try_from(total_nanos / 1_000_000_000).map_err(|_| OUT_OF_RANGE)?;
     let nanos = (total_nanos % 1_000_000_000) as i32;
 
     let duration = Duration::new(seconds, nanos);
 
     if !duration.is_valid() {
-        return Err("duration out of range: must be within approximately 10000 years".to_string());
+        return Err(OUT_OF_RANGE.to_string());
     }
 
     Ok(duration)
@@ -231,7 +233,21 @@ fn parse_fixed_offset(s: &str) -> Result<FixedOffset, String> {
         .parse()
         .map_err(|_| format!("invalid minutes in timezone: '{}'", parts[1]))?;
 
-    let total_seconds = (hours * 3600 + minutes * 60) * if negative { -1 } else { 1 };
+    let total_seconds = hours
+        .checked_mul(3600)
+        .and_then(|hours| {
+            minutes
+                .checked_mul(60)
+                .and_then(|minutes| hours.checked_add(minutes))
+        })
+        .and_then(|seconds| {
+            if negative {
+                seconds.checked_neg()
+            } else {
+                Some(seconds)
+            }
+        })
+        .ok_or_else(|| format!("timezone offset out of range: '{}'", s))?;
 
     FixedOffset::east_opt(total_seconds)
         .ok_or_else(|| format!("timezone offset out of range: '{}'", s))

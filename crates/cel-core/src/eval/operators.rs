@@ -27,20 +27,16 @@ impl<'a> Evaluator<'a> {
                 .map(Value::Int)
                 .unwrap_or_else(|| Value::error(EvalError::overflow("integer negation overflow"))),
             Value::Double(d) => Value::Double(-d),
-            _ => Value::error(EvalError::type_mismatch(
-                "int or double",
-                &value.cel_type().display_name(),
-            )),
+            _ => self.type_error(&value, |actual| {
+                EvalError::type_mismatch("int or double", actual)
+            }),
         }
     }
 
     fn eval_not(&self, value: Value) -> Value {
         match value {
             Value::Bool(b) => Value::Bool(!b),
-            _ => Value::error(EvalError::type_mismatch(
-                "bool",
-                &value.cel_type().display_name(),
-            )),
+            _ => self.type_error(&value, |actual| EvalError::type_mismatch("bool", actual)),
         }
     }
 
@@ -66,6 +62,32 @@ impl<'a> Evaluator<'a> {
         let right_val = self.eval_expr(right);
         if right_val.is_error() {
             return right_val;
+        }
+
+        if self.meter.is_some() {
+            let costs = self
+                .value_cost(&left_val)
+                .and_then(|left| self.value_cost(&right_val).map(|right| (left, right)));
+            let (left_cost, right_cost) = match costs {
+                Ok(costs) => costs,
+                Err(error) => return error,
+            };
+            let total = left_cost.saturating_add(right_cost);
+            // Membership can compare the left value against every list element.
+            // Map/equality work includes key comparisons along B-tree paths.
+            let fuel = if op == BinaryOp::In {
+                left_cost.saturating_mul(right_cost)
+            } else {
+                total.saturating_mul(2 + total.max(1).ilog2() as u64)
+            };
+            let allocation = if op == BinaryOp::Add {
+                total.saturating_mul(8)
+            } else {
+                0
+            };
+            if let Err(error) = self.charge(fuel, allocation) {
+                return error;
+            }
         }
 
         match op {
@@ -386,10 +408,9 @@ impl<'a> Evaluator<'a> {
                 if let Some(key) = MapKey::from_value(&left) {
                     Value::Bool(map.contains_key_with_numeric_coercion(&key))
                 } else {
-                    Value::error(EvalError::type_mismatch(
-                        "valid map key",
-                        &left.cel_type().display_name(),
-                    ))
+                    self.type_error(&left, |actual| {
+                        EvalError::type_mismatch("valid map key", actual)
+                    })
                 }
             }
             _ => Value::error(EvalError::no_matching_overload("_in_")),

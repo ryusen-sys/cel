@@ -33,6 +33,7 @@ mod conversions;
 mod error;
 mod evaluator;
 mod functions;
+mod limits;
 pub(crate) mod message;
 mod operators;
 mod program;
@@ -47,6 +48,7 @@ pub use activation::{
 pub use error::{EvalError, EvalErrorKind};
 pub(crate) use evaluator::Evaluator;
 pub(crate) use functions::{Function, FunctionRegistry, Overload};
+pub use limits::{EvalLimitError, EvalLimitKind, EvalLimits};
 pub use message::MessageValue;
 pub use program::Program;
 pub use proto_registry::{ProtoRegistry, ProtoTypeResolver, StructFieldValue};

@@ -284,8 +284,31 @@ impl<'a> Evaluator<'a> {
     fn builtin_matches(&self, receiver: &Value, arg: &Value) -> Value {
         match (receiver, arg) {
             (Value::String(s), Value::String(pattern)) => {
-                match regex::Regex::new(pattern.as_ref()) {
+                let regex = if self.meter.is_some() {
+                    // A state-size cap is also necessary: short counted repetitions
+                    // can compile into much larger automata than their source.
+                    const STATE_BYTES: u64 = 64 * 1024;
+                    let work = (s.len() as u64)
+                        .saturating_add(pattern.len() as u64)
+                        .saturating_add(1)
+                        .saturating_mul(STATE_BYTES);
+                    if let Err(error) = self.charge(work, STATE_BYTES.saturating_mul(8)) {
+                        return error;
+                    }
+                    regex::RegexBuilder::new(pattern.as_ref())
+                        .size_limit(STATE_BYTES as usize)
+                        .dfa_size_limit(STATE_BYTES as usize)
+                        .build()
+                } else {
+                    regex::Regex::new(pattern.as_ref())
+                };
+                match regex {
                     Ok(re) => Value::Bool(re.is_match(s.as_ref())),
+                    Err(regex::Error::CompiledTooBig(_)) if self.meter.is_some() => self
+                        .meter
+                        .as_ref()
+                        .unwrap()
+                        .stop(super::EvalLimitKind::Allocation),
                     Err(e) => {
                         Value::error(EvalError::invalid_argument(format!("invalid regex: {}", e)))
                     }

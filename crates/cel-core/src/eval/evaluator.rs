@@ -11,12 +11,14 @@
 //! - Proto message construction and field access
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
+use super::limits::Meter;
 use super::proto_registry::ProtoRegistry;
 use super::{
-    Activation, EvalError, FunctionRegistry, HierarchicalActivation, MapKey, OptionalValue, Value,
-    ValueMap,
+    Activation, EvalError, EvalLimitKind, FunctionRegistry, HierarchicalActivation, MapKey,
+    OptionalValue, Value, ValueMap,
 };
 use crate::checker::ReferenceInfo;
 use crate::types::{ComprehensionData, Expr, SpannedExpr};
@@ -47,6 +49,7 @@ pub struct Evaluator<'a> {
     /// When true, as-is resolution takes priority over container prefixing
     /// because local variables should shadow namespace-resolved names.
     pub(super) in_local_scope: bool,
+    pub(super) meter: Option<Rc<Meter>>,
 }
 
 impl<'a> Evaluator<'a> {
@@ -62,7 +65,57 @@ impl<'a> Evaluator<'a> {
             abbreviations: None,
             strong_enums: true,
             in_local_scope: false,
+            meter: None,
         }
+    }
+
+    pub(super) fn with_meter(mut self, meter: Rc<Meter>) -> Self {
+        self.meter = Some(meter);
+        self
+    }
+
+    pub(super) fn charge(&self, fuel: u64, allocation: u64) -> Result<(), Value> {
+        match &self.meter {
+            Some(meter) => meter.charge(fuel, allocation),
+            None => Ok(()),
+        }
+    }
+
+    pub(super) fn value_cost(&self, value: &Value) -> Result<u64, Value> {
+        match &self.meter {
+            Some(meter) => meter.value_cost(value),
+            None => Ok(0),
+        }
+    }
+
+    pub(super) fn type_error(
+        &self,
+        value: &Value,
+        make_error: impl FnOnce(&str) -> EvalError,
+    ) -> Value {
+        if self.meter.is_some() {
+            // cel_type() follows optional chains, then display_name() copies
+            // the inner name at every wrapper. Reserve those copies before
+            // constructing either the type or its diagnostic.
+            let mut inner = value;
+            let mut depth = 0u64;
+            while let Value::Optional(OptionalValue::Some(value)) = inner {
+                inner = value;
+                depth += 1;
+            }
+            let name_bytes = match inner {
+                Value::Enum(value) => value.type_name.len() as u64,
+                _ => 32,
+            };
+            let cost = name_bytes
+                .saturating_add(depth.saturating_mul(32))
+                .saturating_mul(depth + 4)
+                .saturating_mul(2);
+            if let Err(error) = self.charge(cost, cost) {
+                return error;
+            }
+        }
+        Value::error(make_error(&value.cel_type().display_name()))
     }
 
     /// Set the reference map for qualified name resolution (builder pattern).
@@ -130,6 +183,7 @@ impl<'a> Evaluator<'a> {
         'a: 'b,
     {
         let mut eval = Evaluator::new(activation, self.functions);
+        eval.meter = self.meter.clone();
         // Preserve root_activation from parent (don't reset to the child activation)
         eval.root_activation = self.root_activation;
         // Child evaluators are always in local scope (comprehension, bind)
@@ -153,10 +207,54 @@ impl<'a> Evaluator<'a> {
     }
 
     pub(super) fn eval_expr(&self, expr: &SpannedExpr) -> Value {
+        let Some(meter) = &self.meter else {
+            return self.eval_expr_inner(expr);
+        };
+        let previous_span = meter.span.replace(expr.span.clone());
+        let result = (|| {
+            // Includes bounded optional-chain clones (at most 64 Boxes), small
+            // diagnostics and scope metadata. Variable-size work is separate.
+            self.charge(1, 4096)?;
+            let bytes = match &expr.node {
+                Expr::String(s) | Expr::Ident(s) | Expr::RootIdent(s) => s.len() as u64 * 2,
+                Expr::Bytes(b) => b.len() as u64 * 2,
+                Expr::List(values) => values.len() as u64 * std::mem::size_of::<Value>() as u64 * 2,
+                Expr::Map(values) => values.len() as u64 * 256,
+                Expr::Call { args, .. } => {
+                    (args.len() as u64 + 1) * std::mem::size_of::<Value>() as u64 * 2
+                }
+                Expr::Member { field, .. } | Expr::MemberTestOnly { field, .. } => {
+                    field.len() as u64 * 2
+                }
+                Expr::Bind { var_name, .. } => var_name.len() as u64 * 2,
+                Expr::Struct { .. } => return Err(meter.stop(EvalLimitKind::UnmeteredOperation)),
+                _ => 0,
+            };
+            self.charge(bytes, bytes)?;
+            let value = self.eval_expr_inner(expr);
+            meter.validate(&value, 1)?;
+            Ok(value)
+        })();
+        meter.span.replace(previous_span);
+        match result {
+            Ok(value) => value,
+            Err(error) => error,
+        }
+    }
+
+    fn eval_expr_inner(&self, expr: &SpannedExpr) -> Value {
         // Check reference_map for pre-resolved constant values (enum values, etc.)
         if let Some(ref_map) = self.reference_map {
             if let Some(ref_info) = ref_map.get(&expr.id) {
                 if let Some(ref value) = ref_info.value {
+                    let bytes = match value {
+                        crate::CelValue::String(s) => s.len() as u64,
+                        crate::CelValue::Bytes(b) => b.len() as u64,
+                        _ => 0,
+                    };
+                    if let Err(error) = self.charge(bytes, bytes.saturating_mul(2)) {
+                        return error;
+                    }
                     // If this is an enum value, produce Value::Enum or Value::Int
                     if let Some(ref enum_type) = ref_info.enum_type {
                         if let crate::types::CelValue::Int(i) = value {
@@ -266,6 +364,17 @@ impl<'a> Evaluator<'a> {
                 return value;
             }
 
+            let key_cost = match self.value_cost(&key) {
+                Ok(cost) => cost,
+                Err(error) => return error,
+            };
+            if let Err(error) = self.charge(
+                key_cost.saturating_mul(4 + entries.len().max(1).ilog2() as u64),
+                0,
+            ) {
+                return error;
+            }
+
             // Handle optional entries
             if entry.optional {
                 match value {
@@ -278,10 +387,9 @@ impl<'a> Evaluator<'a> {
                             }
                             map.insert(map_key, *v);
                         } else {
-                            return Value::error(EvalError::type_mismatch(
-                                "valid map key",
-                                &key.cel_type().display_name(),
-                            ));
+                            return self.type_error(&key, |actual| {
+                                EvalError::type_mismatch("valid map key", actual)
+                            });
                         }
                     }
                     Value::Optional(OptionalValue::None) => {} // Skip absent optionals
@@ -294,10 +402,9 @@ impl<'a> Evaluator<'a> {
                             }
                             map.insert(map_key, value);
                         } else {
-                            return Value::error(EvalError::type_mismatch(
-                                "valid map key",
-                                &key.cel_type().display_name(),
-                            ));
+                            return self.type_error(&key, |actual| {
+                                EvalError::type_mismatch("valid map key", actual)
+                            });
                         }
                     }
                 }
@@ -307,10 +414,9 @@ impl<'a> Evaluator<'a> {
                 }
                 map.insert(map_key, value);
             } else {
-                return Value::error(EvalError::type_mismatch(
-                    "valid map key",
-                    &key.cel_type().display_name(),
-                ));
+                return self.type_error(&key, |actual| {
+                    EvalError::type_mismatch("valid map key", actual)
+                });
             }
         }
 
@@ -395,10 +501,7 @@ impl<'a> Evaluator<'a> {
             Value::Bool(true) => self.eval_expr(then_expr),
             Value::Bool(false) => self.eval_expr(else_expr),
             Value::Error(_) => cond_val,
-            _ => Value::error(EvalError::type_mismatch(
-                "bool",
-                &cond_val.cel_type().display_name(),
-            )),
+            _ => self.type_error(&cond_val, |actual| EvalError::type_mismatch("bool", actual)),
         }
     }
 
@@ -464,6 +567,14 @@ impl<'a> Evaluator<'a> {
     }
 
     pub(super) fn access_field(&self, value: &Value, field: &str, optional: bool) -> Value {
+        let size = match value {
+            Value::Map(map) => map.len() as u64,
+            _ => 1,
+        };
+        let cost = (field.len() as u64 + 1).saturating_mul(2 + size.max(1).ilog2() as u64);
+        if let Err(error) = self.charge(cost, field.len() as u64 + 128) {
+            return error;
+        }
         match value {
             Value::Map(map) => {
                 let key = MapKey::String(Arc::from(field));
@@ -550,6 +661,22 @@ impl<'a> Evaluator<'a> {
     }
 
     fn access_index(&self, value: &Value, index: &Value, optional: bool) -> Value {
+        if self.meter.is_some() {
+            let cost = match self.value_cost(index) {
+                Ok(cost) => cost,
+                Err(error) => return error,
+            };
+            let size = match value {
+                Value::Map(map) => map.len() as u64,
+                _ => 1,
+            };
+            if let Err(error) = self.charge(
+                cost.saturating_mul(2 + size.max(1).ilog2() as u64),
+                cost.saturating_mul(2),
+            ) {
+                return error;
+            }
+        }
         match value {
             Value::List(list) => {
                 let idx = match index {
@@ -557,10 +684,8 @@ impl<'a> Evaluator<'a> {
                     Value::UInt(u) => *u as i64,
                     Value::Double(d) if d.is_finite() && d.fract() == 0.0 => *d as i64,
                     _ => {
-                        return Value::error(EvalError::type_mismatch(
-                            "int",
-                            &index.cel_type().display_name(),
-                        ))
+                        return self
+                            .type_error(index, |actual| EvalError::type_mismatch("int", actual))
                     }
                 };
 
@@ -628,24 +753,27 @@ impl<'a> Evaluator<'a> {
                         }
                     }
                 } else {
-                    Value::error(EvalError::type_mismatch(
-                        "valid map key",
-                        &index.cel_type().display_name(),
-                    ))
+                    self.type_error(index, |actual| {
+                        EvalError::type_mismatch("valid map key", actual)
+                    })
                 }
             }
             Value::String(s) => {
                 let idx = match index {
                     Value::Int(i) => *i,
                     _ => {
-                        return Value::error(EvalError::type_mismatch(
-                            "int",
-                            &index.cel_type().display_name(),
-                        ))
+                        return self
+                            .type_error(index, |actual| EvalError::type_mismatch("int", actual))
                     }
                 };
 
                 // Convert string to code points for proper indexing
+                if let Err(error) = self.charge(
+                    s.len() as u64,
+                    (s.len() as u64).saturating_mul(4).saturating_add(64),
+                ) {
+                    return error;
+                }
                 let chars: Vec<char> = s.chars().collect();
                 let len = chars.len() as i64;
                 let actual_idx = if idx < 0 { idx + len } else { idx };
@@ -669,10 +797,8 @@ impl<'a> Evaluator<'a> {
                 let idx = match index {
                     Value::Int(i) => *i,
                     _ => {
-                        return Value::error(EvalError::type_mismatch(
-                            "int",
-                            &index.cel_type().display_name(),
-                        ))
+                        return self
+                            .type_error(index, |actual| EvalError::type_mismatch("int", actual))
                     }
                 };
 
@@ -712,10 +838,9 @@ impl<'a> Evaluator<'a> {
                 if optional {
                     Value::optional_none()
                 } else {
-                    Value::error(EvalError::type_mismatch(
-                        "list, map, string, or bytes",
-                        &value.cel_type().display_name(),
-                    ))
+                    self.type_error(value, |actual| {
+                        EvalError::type_mismatch("list, map, string, or bytes", actual)
+                    })
                 }
             }
         }
@@ -727,6 +852,14 @@ impl<'a> Evaluator<'a> {
         args: &[SpannedExpr],
         call_expr: &SpannedExpr,
     ) -> Value {
+        let name_bytes = match &expr.node {
+            Expr::Ident(name) | Expr::RootIdent(name) => name.len() as u64,
+            Expr::Member { field, .. } => field.len() as u64,
+            _ => 0,
+        };
+        if let Err(error) = self.charge(name_bytes, name_bytes.saturating_mul(2)) {
+            return error;
+        }
         // Check reference_map for enum constructor calls
         if let Some(ref_map) = self.reference_map {
             if let Some(ref_info) = ref_map.get(&call_expr.id) {
@@ -808,14 +941,14 @@ impl<'a> Evaluator<'a> {
 
     fn try_qualified_function_name(&self, obj: &SpannedExpr, field: &str) -> Option<String> {
         match &obj.node {
-            Expr::Ident(name) => Some(format!("{}.{}", name, field)),
+            Expr::Ident(name) => self.qualify(name, field),
             Expr::Member {
                 expr: inner,
                 field: inner_field,
                 ..
             } => {
                 let prefix = self.try_qualified_function_name(inner, inner_field)?;
-                Some(format!("{}.{}", prefix, field))
+                self.qualify(&prefix, field)
             }
             _ => None,
         }
@@ -865,6 +998,23 @@ impl<'a> Evaluator<'a> {
     }
 
     fn call_function(&self, name: &str, args: &[Value], is_member: bool) -> Value {
+        if let Some(meter) = &self.meter {
+            // A callback may allocate, loop or suppress errors without consulting
+            // this meter. Refuse it before dispatch, including standard-name overrides.
+            if self.functions.contains(name) {
+                return meter.stop(EvalLimitKind::UnmeteredOperation);
+            }
+            let mut cost = 0u64;
+            for arg in args {
+                match self.value_cost(arg) {
+                    Ok(arg_cost) => cost = cost.saturating_add(arg_cost),
+                    Err(error) => return error,
+                }
+            }
+            if let Err(error) = self.charge(cost, cost.saturating_mul(4).saturating_add(512)) {
+                return error;
+            }
+        }
         // Look up function
         let overloads = self.functions.find_overloads(name, args.len(), is_member);
 
@@ -913,6 +1063,14 @@ impl<'a> Evaluator<'a> {
         match &range_val {
             Value::List(list) => {
                 for (i, elem) in list.iter().enumerate() {
+                    let names = comp.accu_var.len() as u64
+                        + comp.iter_var.len() as u64
+                        + comp.iter_var2.len() as u64;
+                    if let Err(error) =
+                        self.charge(1, 8192u64.saturating_add(names.saturating_mul(2)))
+                    {
+                        return error;
+                    }
                     // Create nested activation with iteration variables
                     let mut iter_activation = HierarchicalActivation::new(self.activation)
                         .with_binding(&comp.accu_var, accu.clone());
@@ -934,15 +1092,17 @@ impl<'a> Evaluator<'a> {
 
                     // Check loop condition
                     let cond = iter_eval.eval_expr(&comp.loop_condition);
+                    if let Err(error) = self.charge(0, 0) {
+                        return error;
+                    }
                     match &cond {
                         Value::Bool(false) => break,
                         Value::Bool(true) => {}
                         Value::Error(_) => {} // continue iteration (not strictly false)
                         _ => {
-                            return Value::error(EvalError::type_mismatch(
-                                "bool",
-                                &cond.cel_type().display_name(),
-                            ))
+                            return self.type_error(&cond, |actual| {
+                                EvalError::type_mismatch("bool", actual)
+                            })
                         }
                     }
 
@@ -952,6 +1112,14 @@ impl<'a> Evaluator<'a> {
             }
             Value::Map(map) => {
                 for (key, val) in map.iter() {
+                    let names = comp.accu_var.len() as u64
+                        + comp.iter_var.len() as u64
+                        + comp.iter_var2.len() as u64;
+                    if let Err(error) =
+                        self.charge(1, 8192u64.saturating_add(names.saturating_mul(2)))
+                    {
+                        return error;
+                    }
                     let mut iter_activation = HierarchicalActivation::new(self.activation)
                         .with_binding(&comp.accu_var, accu.clone());
 
@@ -966,15 +1134,17 @@ impl<'a> Evaluator<'a> {
 
                     // Check loop condition
                     let cond = iter_eval.eval_expr(&comp.loop_condition);
+                    if let Err(error) = self.charge(0, 0) {
+                        return error;
+                    }
                     match &cond {
                         Value::Bool(false) => break,
                         Value::Bool(true) => {}
                         Value::Error(_) => {} // continue iteration (not strictly false)
                         _ => {
-                            return Value::error(EvalError::type_mismatch(
-                                "bool",
-                                &cond.cel_type().display_name(),
-                            ))
+                            return self.type_error(&cond, |actual| {
+                                EvalError::type_mismatch("bool", actual)
+                            })
                         }
                     }
 
@@ -983,10 +1153,9 @@ impl<'a> Evaluator<'a> {
                 }
             }
             _ => {
-                return Value::error(EvalError::type_mismatch(
-                    "list or map",
-                    &range_val.cel_type().display_name(),
-                ))
+                return self.type_error(&range_val, |actual| {
+                    EvalError::type_mismatch("list or map", actual)
+                })
             }
         }
 
@@ -1003,6 +1172,21 @@ impl<'a> Evaluator<'a> {
         // For `has()`, we don't propagate errors - we just check presence
         if value.is_error() {
             return Value::Bool(false);
+        }
+
+        let map = match &value {
+            Value::Map(map) => Some(map),
+            Value::Optional(OptionalValue::Some(inner)) => match inner.as_ref() {
+                Value::Map(map) => Some(map),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(map) = map {
+            let cost = (field.len() as u64 + 1).saturating_mul(2 + map.len().max(1).ilog2() as u64);
+            if let Err(error) = self.charge(cost, field.len() as u64 + 128) {
+                return error;
+            }
         }
 
         match &value {

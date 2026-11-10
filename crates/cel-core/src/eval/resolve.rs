@@ -110,18 +110,26 @@ impl<'a> Evaluator<'a> {
         field: &str,
     ) -> Option<String> {
         match &obj.node {
-            Expr::Ident(name) => Some(format!("{}.{}", name, field)),
-            Expr::RootIdent(name) => Some(format!(".{}.{}", name, field)),
+            Expr::Ident(name) => self.qualify(name, field),
+            Expr::RootIdent(name) => self.qualify(name, field).map(|name| format!(".{name}")),
             Expr::Member {
                 expr: inner,
                 field: inner_field,
                 optional: false,
             } => {
                 let prefix = self.try_qualified_variable_name(inner, inner_field)?;
-                Some(format!("{}.{}", prefix, field))
+                self.qualify(&prefix, field)
             }
             _ => None,
         }
+    }
+
+    pub(super) fn qualify(&self, prefix: &str, field: &str) -> Option<String> {
+        let len = (prefix.len() as u64)
+            .saturating_add(field.len() as u64)
+            .saturating_add(2);
+        self.charge(len, len.saturating_mul(2)).ok()?;
+        Some(format!("{prefix}.{field}"))
     }
 
     /// Check if the leftmost identifier in a member chain resolves in the current activation.
@@ -158,6 +166,9 @@ impl<'a> Evaluator<'a> {
         } else {
             qualified_name
         };
+
+        self.charge(name.len() as u64, (name.len() as u64).saturating_mul(32))
+            .ok()?;
 
         // Collect all dot positions to try progressively shorter prefixes
         let dots: Vec<usize> = name.match_indices('.').map(|(i, _)| i).collect();

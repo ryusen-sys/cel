@@ -1,0 +1,1 @@
+event.text.matches('a{100000}') || true

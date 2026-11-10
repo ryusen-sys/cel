@@ -1,0 +1,128 @@
+name: Recover Untagged Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: v-prefixed release tag to recover
+        required: true
+        type: string
+      release_sha:
+        description: Untagged release commit on main
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate-release:
+    name: Validate recovery request
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    outputs:
+      release_commit: ${{ steps.release.outputs.commit }}
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release commit
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_SHA: ${{ inputs.release_sha }}
+        run: |
+          if ! printf '%s\n' "${RELEASE_TAG}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Invalid release tag: ${RELEASE_TAG}"
+            exit 1
+          fi
+          if ! printf '%s\n' "${RELEASE_SHA}" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "Release SHA must be a full lowercase commit SHA"
+            exit 1
+          fi
+
+          bash scripts/git-with-token.sh fetch origin \
+            "${{ github.event.repository.default_branch }}:refs/remotes/origin/${{ github.event.repository.default_branch }}"
+          release_commit="$(git rev-parse "${RELEASE_SHA}^{commit}")"
+          main_commit="$(git rev-parse "origin/${{ github.event.repository.default_branch }}^{commit}")"
+          if ! git merge-base --is-ancestor "${release_commit}" "${main_commit}"; then
+            echo "Recovery commit ${release_commit} is not on the default branch"
+            exit 1
+          fi
+
+          package_version="$(git show "${release_commit}:Cargo.toml" | sed -n 's/^version = "\(.*\)"/\1/p' | head -n 1)"
+          if [ "${RELEASE_TAG#v}" != "${package_version}" ]; then
+            echo "Release tag ${RELEASE_TAG} does not match Cargo.toml version ${package_version}"
+            exit 1
+          fi
+
+          echo "commit=${release_commit}" >> "$GITHUB_OUTPUT"
+
+  dry-run-release:
+    name: Dry-run recovered release packages
+    needs: validate-release
+    uses: ./.github/workflows/publish-release.yml
+    with:
+      release_tag: ${{ inputs.release_tag }}
+      checkout_ref: ${{ needs.validate-release.outputs.release_commit }}
+      publish: false
+
+  create-tag:
+    name: Create recovered release tag
+    needs: [validate-release, dry-run-release]
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    environment: RELEASE
+    steps:
+      - name: Create chaba2-bot token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_SECRET }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+
+      - name: Checkout release commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.validate-release.outputs.release_commit }}
+          persist-credentials: false
+
+      - name: Validate and create tag
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_COMMIT: ${{ needs.validate-release.outputs.release_commit }}
+        run: |
+          bash scripts/git-with-token.sh fetch origin \
+            "${{ github.event.repository.default_branch }}" --tags
+
+          if git show-ref --verify --quiet "refs/tags/${RELEASE_TAG}"; then
+            actual="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+            if [ "${actual}" != "${RELEASE_COMMIT}" ]; then
+              echo "Tag ${RELEASE_TAG} points to ${actual}, expected ${RELEASE_COMMIT}"
+              exit 1
+            fi
+            exit 0
+          fi
+
+          git tag "${RELEASE_TAG}" "${RELEASE_COMMIT}"
+          bash scripts/git-with-token.sh push origin "${RELEASE_TAG}"
+
+  publish-release:
+    name: Publish validated recovered release
+    needs: [validate-release, dry-run-release, create-tag]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/publish-release.yml
+    secrets: inherit
+    with:
+      release_tag: ${{ inputs.release_tag }}
+      checkout_ref: ${{ needs.validate-release.outputs.release_commit }}
+      publish: true

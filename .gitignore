@@ -1,4 +1,6 @@
 /target
+/dist
+/result
 .DS_Store
 .env
 handoff.md

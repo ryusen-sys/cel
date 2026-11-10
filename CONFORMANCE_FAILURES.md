@@ -1,5 +1,10 @@
 # CEL Conformance Test Failures Report
 
+> Historical upstream snapshot from January 2026, retained for context. These
+> counts and proposed fixes are not the current state of this fork. Run
+> `nix develop --command make conformance` for the pinned inherited harness;
+> see its [README](crates/cel-core-conformance/README.md) for limitations.
+
 **Generated:** 2026-01-27
 **Total Failing Tests:** 841
 

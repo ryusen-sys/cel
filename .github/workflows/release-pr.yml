@@ -1,0 +1,307 @@
+name: Auto-create Release PR
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - changelog.md
+      - Cargo.toml
+      - Cargo.lock
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-pr-main
+  cancel-in-progress: true
+
+jobs:
+  create-release-pr:
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    environment: RELEASE
+    outputs:
+      release_commit: ${{ steps.release-branch.outputs.commit }}
+      release_tag: ${{ steps.next-version.outputs.content }}
+      release_pr: ${{ steps.release-pr.outputs.number }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@33c9ab3ef95cd57c164d9d6eb1f9a46338538d41 # main
+
+      - name: Create chaba2-bot token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_SECRET }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-statuses: write
+
+      - name: Prepare append-only release branch
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          branch="release/next"
+          bot_name='${{ steps.app-token.outputs.app-slug }}[bot]'
+          bot_id="$(gh api "/users/${bot_name}" --jq .id)"
+          git config user.name "${bot_name}"
+          git config user.email "${bot_id}+${bot_name}@users.noreply.github.com"
+
+          if bash scripts/git-with-token.sh ls-remote --exit-code --heads origin "${branch}" >/dev/null; then
+            bash scripts/git-with-token.sh fetch origin "${branch}:refs/remotes/origin/${branch}"
+            git switch -C "${branch}" "origin/${branch}"
+            git merge --no-edit "origin/${{ github.event.repository.default_branch }}"
+          else
+            git switch -c "${branch}" "origin/${{ github.event.repository.default_branch }}"
+          fi
+
+      - name: Check for unreleased commits
+        id: changes
+        run: |
+          latest_tag="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
+
+          if [ -n "${latest_tag}" ]; then
+            ahead="$(git rev-list --count "${latest_tag}"..HEAD)"
+          else
+            ahead="$(git rev-list --count HEAD)"
+          fi
+
+          echo "latest_tag=${latest_tag}" >> "$GITHUB_OUTPUT"
+          echo "ahead=${ahead}" >> "$GITHUB_OUTPUT"
+
+          if [ "${ahead}" -eq 0 ]; then
+            echo "No unreleased commits found"
+          else
+            echo "Found ${ahead} unreleased commits since ${latest_tag:-repo start}"
+          fi
+
+      - name: Compute next version
+        if: steps.changes.outputs.ahead != '0'
+        id: next-version
+        run: |
+          version="$(nix develop --command git cliff 77277ec6a336646d946ee549a5012116378b82e4..HEAD --bumped-version)"
+          echo "content=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if no version bump is needed
+        if: steps.changes.outputs.ahead != '0'
+        id: version-check
+        env:
+          LATEST_TAG: ${{ steps.changes.outputs.latest_tag }}
+          NEXT_TAG: ${{ steps.next-version.outputs.content }}
+        run: |
+          if [ -n "${LATEST_TAG}" ] && [ "${LATEST_TAG}" = "${NEXT_TAG}" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Update package version
+        if: steps.changes.outputs.ahead != '0' && steps.version-check.outputs.skip == 'false'
+        env:
+          RELEASE_TAG: ${{ steps.next-version.outputs.content }}
+        run: |
+          nix develop --command python3 scripts/set-release-version.py "${RELEASE_TAG#v}"
+          nix develop --command cargo metadata --locked --no-deps --format-version 1 >/dev/null
+
+      - name: Generate changelog
+        if: steps.changes.outputs.ahead != '0' && steps.version-check.outputs.skip == 'false'
+        env:
+          RELEASE_TAG: ${{ steps.next-version.outputs.content }}
+          GITHUB_REPO: ${{ github.repository }}
+        run: nix develop --command git cliff 77277ec6a336646d946ee549a5012116378b82e4..HEAD --tag "${RELEASE_TAG}" -o changelog.md
+
+      - name: Generate release notes preview
+        if: steps.changes.outputs.ahead != '0' && steps.version-check.outputs.skip == 'false'
+        env:
+          RELEASE_TAG: ${{ steps.next-version.outputs.content }}
+          GITHUB_REPO: ${{ github.repository }}
+        run: >-
+          nix develop --command git cliff 77277ec6a336646d946ee549a5012116378b82e4..HEAD --unreleased --tag "${RELEASE_TAG}"
+          --strip header -o RELEASE_NOTES.md
+
+      - name: Find existing release PR
+        if: steps.changes.outputs.ahead != '0' && steps.version-check.outputs.skip == 'false'
+        id: existing-pr
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          pr_number="$(gh pr list \
+            --base "${{ github.event.repository.default_branch }}" \
+            --head "release/next" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')"
+
+          echo "pr_number=${pr_number}" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update release branch
+        if: steps.changes.outputs.ahead != '0' && steps.version-check.outputs.skip == 'false'
+        id: release-branch
+        env:
+          RELEASE_TAG: ${{ steps.next-version.outputs.content }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_NUMBER: ${{ steps.existing-pr.outputs.pr_number }}
+        run: |
+          branch="release/next"
+
+          git add changelog.md Cargo.toml Cargo.lock
+
+          if git diff --cached --quiet; then
+            echo "Release branch already matches generated files"
+          else
+            git commit -m "chore(release): ${RELEASE_TAG}"
+          fi
+
+          if [ -n "${PR_NUMBER}" ]; then
+            is_draft="$(gh pr view "${PR_NUMBER}" --json isDraft --jq .isDraft)"
+            if [ "${is_draft}" != true ]; then
+              gh pr ready --undo "${PR_NUMBER}"
+            fi
+          fi
+
+          bash scripts/git-with-token.sh push origin "${branch}"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Mark release build as pending
+        if: steps.release-branch.outputs.commit != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_COMMIT: ${{ steps.release-branch.outputs.commit }}
+        run: |
+          gh api \
+            --method POST \
+            "repos/${{ github.repository }}/statuses/${RELEASE_COMMIT}" \
+            -f state=pending \
+            -f context='Release build dry run' \
+            -f description='Testing and packaging release source'
+
+      - name: Create PR body
+        if: steps.changes.outputs.ahead != '0' && steps.version-check.outputs.skip == 'false'
+        env:
+          RELEASE_TAG: ${{ steps.next-version.outputs.content }}
+          AHEAD: ${{ steps.changes.outputs.ahead }}
+        run: |
+          cat > /tmp/release-pr-body.md <<EOF
+          <!-- auto-release-pr -->
+          ## Release
+
+          This PR prepares \`${RELEASE_TAG}\`.
+
+          - Commits since last tag: ${AHEAD}
+          - Source branch: \`release/next\`
+          - Base branch: \`${{ github.event.repository.default_branch }}\`
+
+          ## Notes Preview
+
+          $(cat RELEASE_NOTES.md)
+          EOF
+
+      - name: Create release PR
+        if: steps.changes.outputs.ahead != '0' && steps.version-check.outputs.skip == 'false' && steps.existing-pr.outputs.pr_number == ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_TAG: ${{ steps.next-version.outputs.content }}
+        run: |
+          gh pr create \
+            --base "${{ github.event.repository.default_branch }}" \
+            --head "release/next" \
+            --title "chore(release): ${RELEASE_TAG}" \
+            --draft \
+            --body-file /tmp/release-pr-body.md
+
+      - name: Update existing release PR
+        if: steps.changes.outputs.ahead != '0' && steps.version-check.outputs.skip == 'false' && steps.existing-pr.outputs.pr_number != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_TAG: ${{ steps.next-version.outputs.content }}
+        run: |
+          gh pr edit "${{ steps.existing-pr.outputs.pr_number }}" \
+            --title "chore(release): ${RELEASE_TAG}" \
+            --body-file /tmp/release-pr-body.md
+
+      - name: Record release PR
+        if: steps.release-branch.outputs.commit != ''
+        id: release-pr
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          pr_number="$(gh pr list \
+            --base "${{ github.event.repository.default_branch }}" \
+            --head "release/next" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')"
+
+          if [ -z "${pr_number}" ]; then
+            echo "Release PR was not found"
+            exit 1
+          fi
+
+          echo "number=${pr_number}" >> "$GITHUB_OUTPUT"
+
+  dry-run-release:
+    name: Dry-run release packages
+    needs: create-release-pr
+    if: needs.create-release-pr.outputs.release_commit != ''
+    permissions:
+      contents: read
+    uses: ./.github/workflows/publish-release.yml
+    with:
+      release_tag: ${{ needs.create-release-pr.outputs.release_tag }}
+      checkout_ref: ${{ needs.create-release-pr.outputs.release_commit }}
+      publish: false
+
+  report-dry-run:
+    name: Report release build result
+    needs: [create-release-pr, dry-run-release]
+    if: always() && needs.create-release-pr.outputs.release_commit != ''
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    environment: RELEASE
+    steps:
+      - name: Create chaba2-bot token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_SECRET }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-pull-requests: write
+          permission-statuses: write
+
+      - name: Update release commit status
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_COMMIT: ${{ needs.create-release-pr.outputs.release_commit }}
+          RELEASE_PR: ${{ needs.create-release-pr.outputs.release_pr }}
+          BUILD_RESULT: ${{ needs.dry-run-release.result }}
+        run: |
+          if [ "${BUILD_RESULT}" = success ]; then
+            state=success
+            description='Release tests and source packaging passed'
+          else
+            state=failure
+            description='Release tests or source packaging failed'
+          fi
+
+          gh api \
+            --method POST \
+            "repos/${{ github.repository }}/statuses/${RELEASE_COMMIT}" \
+            -f state="${state}" \
+            -f context='Release build dry run' \
+            -f description="${description}" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ "${BUILD_RESULT}" = success ]; then
+            gh pr ready "${RELEASE_PR}"
+          fi

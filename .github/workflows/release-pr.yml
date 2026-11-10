@@ -7,6 +7,7 @@ on:
       - changelog.md
       - Cargo.toml
       - Cargo.lock
+      - fuzz/Cargo.lock
   workflow_dispatch:
 
 permissions:
@@ -154,7 +155,7 @@ jobs:
         run: |
           branch="release/next"
 
-          git add changelog.md Cargo.toml Cargo.lock
+          git add changelog.md Cargo.toml Cargo.lock fuzz/Cargo.lock
 
           if git diff --cached --quiet; then
             echo "Release branch already matches generated files"

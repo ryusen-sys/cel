@@ -1,6 +1,9 @@
 /target
 /dist
 /result
+/fuzz/target
+/fuzz/artifacts
+/fuzz/corpus
 .DS_Store
 .env
 handoff.md

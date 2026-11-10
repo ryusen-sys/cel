@@ -13,3 +13,5 @@ chrono-tz = "0.10"
 logos.workspace = true
 regex.workspace = true
 
+[dev-dependencies]
+proptest = "1.6"

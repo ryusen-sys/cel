@@ -1,9 +1,10 @@
-.PHONY: check check-fmt lint test check-workflows conformance conformance-setup conformance-report changelog next-version
+.PHONY: check check-fmt lint test check-workflows conformance conformance-setup conformance-report changelog next-version fuzz-smoke
 
 check: check-fmt lint test check-workflows
 
 check-fmt:
 	cargo fmt --all --check
+	cargo fmt --manifest-path fuzz/Cargo.toml --check
 	nixfmt --check flake.nix
 
 lint:
@@ -27,6 +28,12 @@ conformance:
 
 conformance-report:
 	bash scripts/conformance-report.sh
+
+fuzz-smoke:
+	cargo fetch --manifest-path fuzz/Cargo.toml --locked
+	mkdir -p fuzz/corpus/guard_index fuzz/corpus/compile
+	cargo fuzz run guard_index fuzz/corpus/guard_index fuzz/seeds/guard_index -- -max_total_time=30 -max_len=768 -seed=905436370 -timeout=10
+	cargo fuzz run compile fuzz/corpus/compile fuzz/seeds/compile -- -max_total_time=30 -max_len=512 -seed=905436370 -timeout=10
 
 changelog:
 	git cliff 77277ec6a336646d946ee549a5012116378b82e4..HEAD -o changelog.md

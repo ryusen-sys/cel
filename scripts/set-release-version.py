@@ -28,17 +28,21 @@ def update(root: pathlib.Path, version: str) -> None:
         text, count = re.subn(pattern, lambda match: match[1] + version + match[2], text)
         if count != 1:
             raise ValueError(f"local dependency {name} not found exactly once")
-    lock_path = root / "Cargo.lock"
-    lock = lock_path.read_text()
-    for name in names:
-        pattern = rf'(\[\[package\]\]\nname = "{name}"\nversion = "){re.escape(old)}("\n)'
-        lock, count = re.subn(pattern, lambda match: match[1] + version + match[2], lock)
-        if count != 1:
-            raise ValueError(f"workspace lock entry {name} not found exactly once")
+    locks = {}
+    for filename, packages in [("Cargo.lock", names), ("fuzz/Cargo.lock", ["cel-core"])]:
+        lock_path = root / filename
+        lock = lock_path.read_text()
+        for name in packages:
+            pattern = rf'(\[\[package\]\]\nname = "{name}"\nversion = "){re.escape(old)}("\n)'
+            lock, count = re.subn(pattern, lambda match: match[1] + version + match[2], lock)
+            if count != 1:
+                raise ValueError(f"{filename} entry {name} not found exactly once")
+        tomllib.loads(lock)
+        locks[lock_path] = lock
     tomllib.loads(text)
-    tomllib.loads(lock)
     path.write_text(text)
-    lock_path.write_text(lock)
+    for lock_path, lock in locks.items():
+        lock_path.write_text(lock)
 
 
 if __name__ == "__main__":

@@ -11,7 +11,8 @@ publication requires a separate naming/ownership decision and is not configured.
    checks on all PR bases, including stacked branches, and on `main`.
 2. A `main` push updates the append-only `release/next` branch. Git-cliff infers
    the next version; one shared version updates the workspace manifest, local
-   dependencies and all three workspace lock entries. Only fork commits after
+   dependencies, all three workspace lock entries and the fuzz lock's local
+   `cel-core` entry. Only fork commits after
    `77277ec6a336646d946ee549a5012116378b82e4` enter `changelog.md`.
 3. A rolling draft release PR receives a `Release build dry run` status. Its
    exact head runs formatting, lint, tests, the pinned upstream conformance
@@ -58,7 +59,8 @@ Before merging or enabling release workflows, an administrator must configure:
 - GitHub Actions enabled, the pinned external actions allowed, and the org's
   `blacksmith-2vcpu-ubuntu-2404` runner available to this repository.
 - Squash-only merging using PR titles; protect `main` and require `Validate title`,
-  `Check`, `Upstream conformance harness` and `Nix build` checks.
+  `Check`, `Upstream conformance harness`, `Nix build` and `Differential fuzz smoke`
+  checks.
 - A `RELEASE` environment restricted to protected `main`, never tags. Set
   `RELEASE_APP_ID` and `RELEASE_APP_SECRET` there using the existing release App.
 - Install that App for this repository with contents, pull-request and commit

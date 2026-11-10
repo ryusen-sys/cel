@@ -30,7 +30,7 @@ impl Template {
     pub fn compile(env: &Env, source: &str) -> Self {
         let ast = env
             .compile(source)
-            .expect("benchmark expression must check");
+            .unwrap_or_else(|error| panic!("benchmark expression must check: {source}: {error}"));
         Self {
             program: env.program(&ast).expect("benchmark program must build"),
             guards: required_guards(&ast),

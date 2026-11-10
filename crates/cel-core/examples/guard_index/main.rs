@@ -1,7 +1,12 @@
 //! Seeded full-CEL-scan versus required-string-guard prototype.
 //! Run with `cargo run --release -p cel-core --example guard_index -- --help`.
 
+mod corpus;
+#[cfg(test)]
+mod differential;
 mod index;
+#[cfg(test)]
+mod properties;
 
 use std::hint::black_box;
 use std::time::Instant;
@@ -152,19 +157,46 @@ const WORKLOADS: [Workload; 7] = [
 
 fn templates() -> Vec<Template> {
     let env = environment();
+    template_sources()
+        .iter()
+        .map(|source| Template::compile(&env, source))
+        .collect()
+}
+
+fn template_sources() -> Vec<String> {
     [false, true]
         .into_iter()
         .flat_map(|opaque| {
-            FIELDS.iter().map(move |field| {
-                let equality = if opaque {
-                    format!("!(async.data.{field} != event.data.{field})")
-                } else {
-                    format!("async.data.{field} == event.data.{field}")
-                };
-                format!("{equality} && async.data.amount > event.data.minimum")
+            corpus::PREDICATES.iter().enumerate().flat_map(move |(variant, (_, predicate))| {
+                // Keep residual-only guards out of the controlled anchor
+                // distribution without replacing their CEL evaluation.
+                let predicate = format!("!!({predicate})");
+                FIELDS.iter().map(move |field| {
+                    let equality = if opaque {
+                        match variant % 4 {
+                            0 => format!("!(async.data.{field} != event.data.{field})"),
+                            1 => format!("(async.data.{field} == event.data.{field} || false)"),
+                            2 => format!("(true ? async.data.{field} == event.data.{field} : false)"),
+                            _ => format!("[async.data.{field}].exists(key, key == event.data.{field})"),
+                        }
+                    } else {
+                        match variant % 4 {
+                            0 => format!("async.data.{field} == event.data.{field}"),
+                            1 => format!("event.data.{field} == async.data.{field}"),
+                            2 => format!("async.data['{field}'] == event.data['{field}']"),
+                            _ => format!(".async.data.{field} == .event.data.{field}"),
+                        }
+                    };
+                    // Vary both tree association and guard position. The whole
+                    // checked program, including every macro, remains intact.
+                    if variant % 2 == 0 {
+                        format!("{equality} && ({predicate}) && async.data.amount > event.data.minimum")
+                    } else {
+                        format!("({predicate}) && (async.data.amount > event.data.minimum && {equality})")
+                    }
+                })
             })
         })
-        .map(|source| Template::compile(&env, &source))
         .collect()
 }
 
@@ -183,8 +215,10 @@ fn registrations(count: usize, workload: Workload, random: &mut Random) -> Vec<R
                 (random.next() % 200) as i64
             };
             let opaque = id % 1_000 < workload.unindexed_per_mille;
+            let variant = (id / FIELDS.len()) % corpus::PREDICATES.len();
             Registration {
-                template: field + usize::from(opaque) * FIELDS.len(),
+                template: field
+                    + FIELDS.len() * (variant + usize::from(opaque) * corpus::PREDICATES.len()),
                 captured: envelope([
                     (FIELDS[field].to_owned(), key.into()),
                     ("minimum".to_owned(), minimum.into()),
@@ -224,7 +258,7 @@ fn events(
                 })
                 .collect();
             entries.push(("amount".to_owned(), 100i64.into()));
-            envelope(entries)
+            corpus::incoming(entries)
         })
         .collect()
 }
@@ -256,6 +290,11 @@ fn run(workload: Workload, count: usize, event_count: usize, seed: u64) {
     let templates = templates();
     let registrations = registrations(count, workload, &mut random);
     let events = events(event_count, workload, &registrations, &mut random);
+    let mut used = vec![false; templates.len()];
+    for registration in &registrations {
+        used[registration.template] = true;
+    }
+    let used_programs = used.into_iter().filter(|used| *used).count();
     let preparation = started.elapsed();
     let base_rss = rss_kib();
     let started = Instant::now();
@@ -269,8 +308,8 @@ fn run(workload: Workload, count: usize, event_count: usize, seed: u64) {
     }
     let build = started.elapsed();
     println!(
-        "{{\"record\":\"setup\",\"workload\":\"{}\",\"registrations\":{count},\"templates\":{},\"events\":{event_count},\"seed\":{seed},\"preparation_ns\":{},\"index_build_ns\":{},\"rss_before_index_kib\":{base_rss},\"rss_with_index_kib\":{},\"unindexed\":{},\"paths\":{},\"concurrency\":1}}",
-        workload.name, templates.len(), preparation.as_nanos(), build.as_nanos(), rss_kib(), index.unindexed_count(), index.path_count(),
+        "{{\"record\":\"setup\",\"workload\":\"{}\",\"registrations\":{count},\"templates\":{},\"used_programs\":{used_programs},\"predicate_families\":{},\"events\":{event_count},\"seed\":{seed},\"preparation_ns\":{},\"index_build_ns\":{},\"rss_before_index_kib\":{base_rss},\"rss_with_index_kib\":{},\"unindexed\":{},\"paths\":{},\"concurrency\":1}}",
+        workload.name, templates.len(), corpus::PREDICATES.len(), preparation.as_nanos(), build.as_nanos(), rss_kib(), index.unindexed_count(), index.path_count(),
     );
 
     // Warm both routes using the same event; no parsing in either timed route.
@@ -320,6 +359,9 @@ fn run(workload: Workload, count: usize, event_count: usize, seed: u64) {
         assert_eq!(scan_result.errors, 0, "generated data must be valid");
         assert_eq!(indexed_result.errors, 0);
         assert_eq!(scan_result.calls, count);
+        if workload.all_match {
+            assert_eq!(scan_result.matches.len(), count);
+        }
         println!(
             "{{\"record\":\"event\",\"workload\":\"{}\",\"event\":{event_id},\"scan_ns\":{},\"indexed_ns\":{},\"selection_ns\":{},\"scan_calls\":{},\"indexed_calls\":{},\"matches\":{},\"match_sets_equal\":true}}",
             workload.name, scan_time.as_nanos(), index_time.as_nanos(), selection.as_nanos(), scan_result.calls, indexed_result.calls, scan_result.matches.len(),
@@ -375,8 +417,16 @@ fn main() {
             "--events" => event_count = args.next().unwrap().parse().unwrap(),
             "--seed" => seed = args.next().unwrap().parse().unwrap(),
             "--workload" => workload = args.next().unwrap(),
+            "--list-templates" => {
+                for (id, source) in template_sources().iter().enumerate() {
+                    let family =
+                        corpus::PREDICATES[(id / FIELDS.len()) % corpus::PREDICATES.len()].0;
+                    println!("{id}\t{family}\t{source}");
+                }
+                return;
+            }
             "--help" => {
-                println!("guard_index [--registrations 1000000] [--events 24] [--seed {SEED}] [--workload NAME]\nWorkloads: {}\nLinux RSS measurement; release build; one process/thread; NDJSON on stdout.", WORKLOADS.map(|w| w.name).join(", "));
+                println!("guard_index [--registrations 1000000] [--events 24] [--seed {SEED}] [--workload NAME] [--list-templates]\nWorkloads: {}\nLinux RSS measurement; release build; one process/thread; NDJSON on stdout.", WORKLOADS.map(|w| w.name).join(", "));
                 return;
             }
             _ => panic!("unknown argument {arg}"),
@@ -394,6 +444,65 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diverse_corpus_checks_and_executes_every_program() {
+        let templates = templates();
+        let sources = template_sources();
+        let captured = envelope(
+            FIELDS
+                .into_iter()
+                .map(|field| (field.to_owned(), "x".into()))
+                .chain([("minimum".to_owned(), (-1i64).into())]),
+        );
+        let incoming = corpus::incoming(
+            FIELDS
+                .into_iter()
+                .map(|field| (field.to_owned(), "x".into())),
+        );
+        for (id, template) in templates.iter().enumerate() {
+            let value = template.program.eval(&Bindings {
+                captured: &captured,
+                incoming: &incoming,
+            });
+            assert!(
+                matches!(value, Value::Bool(true)),
+                "{}: {value:?}",
+                sources[id]
+            );
+        }
+    }
+
+    #[test]
+    fn benchmark_controls_have_exact_fallback_populations_and_misses() {
+        let templates = templates();
+        let incoming = corpus::incoming(
+            FIELDS
+                .into_iter()
+                .map(|field| (field.to_owned(), "absent".into())),
+        );
+        // Ten complete 1,000-registration blocks exercise every family and
+        // guard mode. Expected counts come from the workload contract, not
+        // from the planner or the registrations it happens to select.
+        for (workload, expected) in WORKLOADS.into_iter().zip([0, 0, 10, 100, 0, 10_000, 0]) {
+            let registrations = registrations(10_000, workload, &mut Random(SEED));
+            let mut index = GuardIndex::default();
+            for (id, registration) in registrations.iter().enumerate() {
+                index.insert(
+                    id as u32,
+                    &templates[registration.template],
+                    &registration.captured,
+                );
+            }
+            assert_eq!(index.unindexed_count(), expected, "{}", workload.name);
+            assert_eq!(
+                index.candidates(&incoming).len(),
+                expected,
+                "{}",
+                workload.name
+            );
+        }
+    }
 
     fn compare(sources: &[&str], captured: &Value, incoming: &Value) -> (Vec<u32>, usize) {
         let env = environment();

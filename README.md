@@ -1,18 +1,24 @@
-# CEL-Core
+# CEL for Ryusen
 
-A spec-complete [Common Expression Language](https://github.com/google/cel-spec) (CEL) implementation written in rust.
+A Rust implementation of the [Common Expression Language](https://github.com/google/cel-spec) (CEL), maintained by Ryusen.
 
-CEL-Core provides the full CEL pipeline — parsing, type checking, and evaluation — with wire compatibility to [cel-go](https://github.com/google/cel-go) and [cel-cpp](https://github.com/google/cel-cpp) through protobuf AST conversion.
+This repository is a fork of [ponix-dev/cel-core](https://github.com/ponix-dev/cel-core), created by Simon Rall and the upstream contributors. It starts from upstream **0.5.1** ([77277ec](https://github.com/ponix-dev/cel-core/commit/77277ec6a336646d946ee549a5012116378b82e4)). We retain their MIT/Apache-2.0 licensing and notices. Thank you to the original authors for the parser, checker, evaluator and protobuf interoperability this work builds on.
+
+The inherited pipeline includes parsing, type checking, evaluation and protobuf AST conversion for interoperation with [cel-go](https://github.com/google/cel-go) and [cel-cpp](https://github.com/google/cel-cpp). This fork is being evaluated and hardened for server-side use; **full CEL conformance and safe execution of untrusted expressions are not yet established**. Known gaps include recursion limits, native evaluation/allocation budgets, dynamic type inference and runtime error positions.
+
+The [guard-index example](crates/cel-core/examples/guard_index/README.md) explores conservative candidate selection followed by complete CEL evaluation. It is an experiment, not a production matcher.
 
 ## Installation
 
 ```toml
 [dependencies]
-cel-core = "0.1"
+cel-core = { git = "https://github.com/ryusen-sys/cel", rev = "4b01f1fec93a25efd21bebe047e42497eea8d5b6" }
 
 # Optional: proto wire format interop with cel-go/cel-cpp
-cel-core-proto = "0.1"
+cel-core-proto = { git = "https://github.com/ryusen-sys/cel", rev = "4b01f1fec93a25efd21bebe047e42497eea8d5b6" }
 ```
+
+These pins select the initial prototype revision; choose a reviewed commit or release tag for your application. The existing `cel-core` and `cel-core-proto` packages on crates.io belong to upstream, not this fork. Our release pipeline publishes GitHub source archives only.
 
 ## The CEL Environment
 
@@ -41,6 +47,9 @@ assert_eq!(result, Value::Bool(true));
 Compilation (parsing + type checking) is the expensive step. Once you have a `Program`, evaluation is fast and can be called repeatedly with different variable bindings.
 
 ```rust
+let env = Env::with_standard_library()
+    .with_variable("age", CelType::Int)
+    .with_variable("threshold", CelType::Int);
 let ast = env.compile("age >= threshold")?;
 let program = env.program(&ast)?;
 
@@ -55,7 +64,7 @@ for threshold in [18, 21, 65] {
 
 ### Extensions
 
-CEL-Core implements the standard CEL extension libraries. Enable them individually or all at once:
+The inherited library includes opt-in CEL extensions. Extensions are separate from the core language; enable only those your application supports:
 
 ```rust
 use cel_core::ext;
@@ -133,7 +142,7 @@ let env = Env::with_standard_library()
 
 ### Error handling
 
-CEL treats errors as values — evaluation never panics. Errors propagate through expressions following CEL's error semantics, including short-circuit behavior with logical operators:
+Ordinary evaluation errors are returned as `Value::Error`, including through logical operators. This is not a guarantee against panics, stack exhaustion or excessive resource use: the inherited engine still needs depth and resource limits before accepting arbitrary untrusted input.
 
 ```rust
 let result = program.eval(&activation);
@@ -174,9 +183,7 @@ let decoded = CheckedExpr::decode(bytes.as_slice())?;
 
 ## Conformance
 
-CEL-Core passes **100% of the official cel-spec conformance tests** across all 29 test files and all three test phases (parse, check, eval), including tests that cel-go itself currently skips. The project maintains a zero-regression policy against the conformance baseline.
-
-For details on what is tested and how to run the conformance suite, see the [conformance README](crates/cel-core-conformance/README.md).
+CI runs the inherited conformance harness against the **pinned** cel-spec submodule, in addition to unit, example and documentation tests. A green harness run is not proof of strict CEL conformance: some comparisons are permissive, and source audits and probes have found semantic and safety gaps outside its cases. See the [conformance README](crates/cel-core-conformance/README.md) for the exact boundary and commands. The [January 2026 failure report](CONFORMANCE_FAILURES.md) and recorded baseline are historical upstream snapshots, not current measurements.
 
 ## Crate Structure
 
@@ -188,18 +195,20 @@ For details on what is tested and how to run the conformance suite, see the [con
 
 ## Development
 
-This project uses [mise](https://mise.jdx.dev/) for tool management and task running.
+Use the pinned Nix shell for development and CI. The lock file pins the same Nix inputs used by Ryusen; the Rust toolchain is 1.98.0.
 
 ```bash
-# First-time setup
-mise trust && mise install
-mise run conformance:setup  # initialize cel-spec submodule
-
-# Testing
-mise run test               # all tests (excludes conformance)
-mise run conformance:test   # cel-spec conformance tests
-mise run conformance:report # conformance report with baseline comparison
+nix develop
+make check                 # formatting, lint, tests and workflow checks
+make conformance-setup     # initialize the pinned cel-spec submodule
+make conformance           # inherited conformance harness; missing data fails
+make conformance-report    # diagnostic report; does not update the baseline
+nix flake check -L         # isolated library build and tests
 ```
+
+For protobuf regeneration, the shell also supplies `buf`, `protoc-gen-prost` and `protoc-gen-prost-crate`; review generated diffs before committing them. Do not advance the cel-spec submodule implicitly during tests.
+
+Pull request titles use Conventional Commits and become squash-merge subjects. See [releasing](docs/releasing.md) for allowed types, git-cliff commands, the release PR flow and repository settings. Fork changes are generated into [changelog.md](changelog.md); the original changelog is preserved byte-for-byte in [changelog.prev.md](changelog.prev.md).
 
 ## License
 

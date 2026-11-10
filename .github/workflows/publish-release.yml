@@ -1,0 +1,96 @@
+name: Build and publish release
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        required: true
+        type: string
+      checkout_ref:
+        required: true
+        type: string
+      publish:
+        required: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-release-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Validate and package source
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.checkout_ref }}
+          submodules: true
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@33c9ab3ef95cd57c164d9d6eb1f9a46338538d41 # main
+      - name: Validate release commit and version
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_COMMIT: ${{ inputs.checkout_ref }}
+        run: bash scripts/verify-release-tag.sh "${RELEASE_TAG}" "${RELEASE_COMMIT}"
+      - run: nix develop --command make check conformance
+        env:
+          CARGO_PROFILE_TEST_DEBUG: "0"
+          CARGO_INCREMENTAL: "0"
+      - name: Package source
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_COMMIT: ${{ inputs.checkout_ref }}
+        run: nix develop --command bash scripts/package-release.sh "${RELEASE_TAG}" "${RELEASE_COMMIT}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-source-${{ inputs.checkout_ref }}
+          path: dist/*
+          if-no-files-found: error
+          overwrite: true
+
+  release:
+    name: Publish GitHub release
+    if: inputs.publish
+    needs: build
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    environment: RELEASE
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.checkout_ref }}
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@33c9ab3ef95cd57c164d9d6eb1f9a46338538d41 # main
+      - name: Revalidate tag before credentials
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          RELEASE_COMMIT: ${{ inputs.checkout_ref }}
+        run: bash scripts/verify-release-tag.sh "${RELEASE_TAG}" "${RELEASE_COMMIT}" require-tag
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-source-${{ inputs.checkout_ref }}
+          path: dist
+      - name: Generate release notes
+        run: nix develop --command git cliff 77277ec6a336646d946ee549a5012116378b82e4..HEAD --latest --strip header -o RELEASE_NOTES.md
+      - name: Create chaba2-bot token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_SECRET }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          tag_name: ${{ inputs.release_tag }}
+          body_path: RELEASE_NOTES.md
+          files: dist/*
+          fail_on_unmatched_files: true
+          overwrite_files: true

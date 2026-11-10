@@ -1,0 +1,138 @@
+name: Auto-tag Release Commits
+
+on:
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-tag-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  tag-release:
+    if: github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'release/next' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.ref == github.event.repository.default_branch
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    environment: RELEASE
+    outputs:
+      release_commit: ${{ steps.release.outputs.commit }}
+      release_tag: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - name: Checkout trusted release verifier
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .release-verifier
+          persist-credentials: false
+          sparse-checkout: scripts/verify-release-status.sh
+
+      - name: Create chaba2-bot token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_SECRET }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-statuses: read
+
+      - name: Verify release package dry run
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          RELEASE_COMMIT: ${{ github.event.pull_request.head.sha }}
+          RELEASE_APP: ${{ steps.app-token.outputs.app-slug }}[bot]
+        run: |
+          gh api \
+            "repos/${{ github.repository }}/commits/${RELEASE_COMMIT}/status" |
+            bash .release-verifier/scripts/verify-release-status.sh "${RELEASE_APP}"
+
+      - name: Checkout merge commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+          persist-credentials: false
+
+      - name: Verify tested and merged trees match
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          bash scripts/git-with-token.sh fetch origin \
+            "refs/pull/${PR_NUMBER}/head:refs/remotes/origin/release-pr-head"
+
+          fetched_head="$(git rev-parse 'refs/remotes/origin/release-pr-head^{commit}')"
+          if [ "${fetched_head}" != "${PR_HEAD_SHA}" ]; then
+            echo "Fetched release head ${fetched_head} does not match reviewed head ${PR_HEAD_SHA}"
+            exit 1
+          fi
+
+          tested_tree="$(git rev-parse "${PR_HEAD_SHA}^{tree}")"
+          merged_tree="$(git rev-parse 'HEAD^{tree}')"
+          if [ "${tested_tree}" != "${merged_tree}" ]; then
+            echo "Merged tree ${merged_tree} differs from dry-run tree ${tested_tree}"
+            echo "Run Recover Untagged Release against the merged commit after reviewing the difference"
+            exit 1
+          fi
+
+      - name: Determine release tag
+        id: release
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          bash scripts/git-with-token.sh fetch --tags origin
+
+          if ! printf '%s\n' "${PR_TITLE}" | grep -Eq '^chore\(release\): v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Release PR title is not valid: ${PR_TITLE}"
+            exit 1
+          fi
+
+          tag_name="$(printf '%s\n' "${PR_TITLE}" | sed -E 's/^chore\(release\): (v[0-9]+\.[0-9]+\.[0-9]+)$/\1/')"
+          package_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+
+          if [ "${tag_name#v}" != "${package_version}" ]; then
+            echo "Release tag ${tag_name} does not match Cargo.toml version ${package_version}"
+            exit 1
+          fi
+
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tag_name=${tag_name}" >> "$GITHUB_OUTPUT"
+
+          if git show-ref --verify --quiet "refs/tags/${tag_name}"; then
+            actual="$(git rev-parse "refs/tags/${tag_name}^{commit}")"
+            expected="$(git rev-parse HEAD)"
+            if [ "${actual}" != "${expected}" ]; then
+              echo "Tag ${tag_name} points to ${actual}, expected ${expected}"
+              exit 1
+            fi
+
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push tag
+        if: steps.release.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          git tag "${{ steps.release.outputs.tag_name }}"
+          bash scripts/git-with-token.sh push origin "${{ steps.release.outputs.tag_name }}"
+
+  publish-release:
+    name: Publish validated release
+    needs: tag-release
+    permissions:
+      contents: read
+    uses: ./.github/workflows/publish-release.yml
+    secrets: inherit
+    with:
+      release_tag: ${{ needs.tag-release.outputs.release_tag }}
+      checkout_ref: ${{ needs.tag-release.outputs.release_commit }}
+      publish: true

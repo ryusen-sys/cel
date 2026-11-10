@@ -6,12 +6,12 @@ claim of CEL conformance. The parser, checker and evaluator are unchanged.
 
 ## Run in the pinned toolchain
 
-From this repository, use the existing Ryusen Nix shell; replace the path with
-your Ryusen checkout. No additional dependencies are needed.
+Use this repository's pinned Nix shell. No separate Ryusen checkout or
+additional dependencies are needed.
 
 ```sh
-nix develop /path/to/ryusen --command cargo test -p cel-core --example guard_index --locked
-nix develop /path/to/ryusen --command cargo build -p cel-core --release --example guard_index --locked
+nix develop --command cargo test -p cel-core --example guard_index --locked
+nix develop --command cargo build -p cel-core --release --example guard_index --locked
 target/release/examples/guard_index --registrations 1000000 --events 24 --workload selective
 ```
 

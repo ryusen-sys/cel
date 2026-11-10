@@ -37,6 +37,8 @@ class ReleaseChecks(unittest.TestCase):
         publisher = workflows["publish-release.yml"]
         self.assertLess(publisher.index("require-tag"), publisher.index("name: Create chaba2-bot token"))
         self.assertIn("publish: false", workflows["release-pr.yml"])
+        self.assertIn("git add changelog.md Cargo.toml Cargo.lock fuzz/Cargo.lock", workflows["release-pr.yml"])
+        self.assertIn("      - fuzz/Cargo.lock", workflows["release-pr.yml"])
         self.assertIn("needs: tag-release", workflows["release-tag.yml"])
         self.assertIn("needs: [validate-release, dry-run-release, create-tag]", workflows["recover-release.yml"])
 
@@ -55,25 +57,29 @@ class ReleaseChecks(unittest.TestCase):
         update = runpy.run_path(str(ROOT / "scripts/set-release-version.py"))["update"]
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
-            for name in ["Cargo.toml", "Cargo.lock"]:
+            (root / "fuzz").mkdir()
+            for name in ["Cargo.toml", "Cargo.lock", "fuzz/Cargo.lock"]:
                 shutil.copyfile(ROOT / name, root / name)
-            old = tomllib.loads((root / "Cargo.lock").read_text())
+            old = {name: tomllib.loads((root / name).read_text())
+                   for name in ["Cargo.lock", "fuzz/Cargo.lock"]}
             for invalid in ["v1.2.3", "1.2", "01.2.3", "1.2.3-rc.1", "1.2.3\n"]:
                 with self.assertRaises(ValueError):
                     update(root, invalid)
-            self.assertEqual(tomllib.loads((root / "Cargo.lock").read_text()), old)
+            for name, lock in old.items():
+                self.assertEqual(tomllib.loads((root / name).read_text()), lock)
             update(root, "1.2.3")
             update(root, "1.2.3")  # retry is idempotent
             manifest = tomllib.loads((root / "Cargo.toml").read_text())["workspace"]
             self.assertEqual(manifest["package"]["version"], "1.2.3")
             for name in ["cel-core", "cel-core-proto"]:
                 self.assertEqual(manifest["dependencies"][name]["version"], "1.2.3")
-            lock = tomllib.loads((root / "Cargo.lock").read_text())
-            for before, after in zip(old["package"], lock["package"], strict=True):
-                expected = dict(before)
-                if before["name"] in ["cel-core", "cel-core-proto", "cel-core-conformance"]:
-                    expected["version"] = "1.2.3"
-                self.assertEqual(after, expected)
+            for filename, previous in old.items():
+                lock = tomllib.loads((root / filename).read_text())
+                for before, after in zip(previous["package"], lock["package"], strict=True):
+                    expected = dict(before)
+                    if before["name"] in ["cel-core", "cel-core-proto", "cel-core-conformance"]:
+                        expected["version"] = "1.2.3"
+                    self.assertEqual(after, expected)
 
     def test_status_requires_current_success_from_trusted_app(self):
         trusted = "release-fixture[bot]"

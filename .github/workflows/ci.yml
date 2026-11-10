@@ -58,3 +58,21 @@ jobs:
           persist-credentials: false
       - uses: DeterminateSystems/nix-installer-action@33c9ab3ef95cd57c164d9d6eb1f9a46338538d41 # main
       - run: nix flake check -L
+
+  fuzz:
+    name: Differential fuzz smoke
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: DeterminateSystems/nix-installer-action@33c9ab3ef95cd57c164d9d6eb1f9a46338538d41 # main
+      - run: nix develop .#fuzz --command make fuzz-smoke
+      - name: Preserve failing fuzz inputs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fuzz-failures
+          path: fuzz/artifacts
+          if-no-files-found: ignore

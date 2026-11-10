@@ -1,0 +1,1 @@
+async.data.key == event.data.key && async.data.amount > 0

@@ -74,6 +74,16 @@
             protoc-gen-prost-crate
           ];
         };
+        devShells.fuzz = pkgs.mkShell {
+          packages = [
+            (pkgs.rust-bin.nightly."2026-08-28".default.override {
+              extensions = [ "rust-src" ];
+            })
+            pkgs.cargo-fuzz
+            pkgs.clang
+            pkgs.gnumake
+          ];
+        };
       }
     );
 }

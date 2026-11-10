@@ -1,0 +1,27 @@
+[package]
+name = "ryusen-cel-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+cel-core = { path = "../crates/cel-core" }
+
+[[bin]]
+name = "guard_index"
+path = "fuzz_targets/guard_index.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "compile"
+path = "fuzz_targets/compile.rs"
+test = false
+doc = false
+bench = false

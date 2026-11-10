@@ -71,6 +71,9 @@ pub enum MacroExpansion {
     /// Macro signature matched but expansion failed (e.g., invalid arguments).
     /// The string contains an error message.
     Error(String),
+    /// A resource ceiling prevents expansion. Abort parsing without a partial
+    /// AST, rather than recovering with an error-placeholder expression.
+    ResourceLimit(String),
 }
 
 /// Context provided to macro expanders for creating AST nodes.
@@ -1793,6 +1796,17 @@ fn expand_cel_block(
                     "cel.block() first argument must be a non-empty list".to_string(),
                 );
             }
+            // Each slot adds a Bind level above the result. Reject excessive
+            // spines before building them: dropping an over-deep rejected
+            // tree after expansion is itself recursive. Individual argument
+            // depths are bounded by the parser; it checks the combined depth
+            // after this bounded expansion too.
+            if elements.len() >= super::parse::MAX_AST_DEPTH {
+                return MacroExpansion::ResourceLimit(format!(
+                    "expanded expression exceeds depth limit of {}",
+                    super::parse::MAX_AST_DEPTH
+                ));
+            }
             elements.clone()
         }
         _ => {
@@ -2211,7 +2225,9 @@ mod tests {
                 }
                 other => panic!("expected Member, got {:?}", other),
             },
-            MacroExpansion::Error(e) => panic!("unexpected error: {}", e),
+            MacroExpansion::Error(e) | MacroExpansion::ResourceLimit(e) => {
+                panic!("unexpected error: {}", e)
+            }
         }
     }
 
@@ -2244,7 +2260,9 @@ mod tests {
                 }
                 other => panic!("expected MemberTestOnly, got {:?}", other),
             },
-            MacroExpansion::Error(e) => panic!("unexpected error: {}", e),
+            MacroExpansion::Error(e) | MacroExpansion::ResourceLimit(e) => {
+                panic!("unexpected error: {}", e)
+            }
         }
     }
 

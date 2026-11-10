@@ -33,7 +33,7 @@ fuzz-smoke:
 	cargo fetch --manifest-path fuzz/Cargo.toml --locked
 	mkdir -p fuzz/corpus/guard_index fuzz/corpus/compile
 	cargo fuzz run guard_index fuzz/corpus/guard_index fuzz/seeds/guard_index -- -max_total_time=30 -max_len=768 -seed=905436370 -timeout=10
-	cargo fuzz run compile fuzz/corpus/compile fuzz/seeds/compile -- -max_total_time=30 -max_len=512 -seed=905436370 -timeout=10
+	cargo fuzz run compile fuzz/corpus/compile fuzz/seeds/compile -- -max_total_time=30 -max_len=4096 -seed=905436370 -timeout=10
 
 changelog:
 	git cliff 77277ec6a336646d946ee549a5012116378b82e4..HEAD -o changelog.md

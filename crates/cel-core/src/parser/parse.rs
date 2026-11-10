@@ -17,6 +17,12 @@ pub struct ParseError {
 /// Used to preserve source information for IDE features.
 pub type MacroCalls = HashMap<i64, SpannedExpr>;
 
+// Bound both parser recursion and the resulting tree: iterative grammar rules
+// can produce deep trees too, and macro expansion adds nodes not in the source.
+pub(super) const MAX_RECURSION_DEPTH: usize = 64;
+pub(super) const MAX_AST_DEPTH: usize = 128;
+pub(super) const MAX_AST_NODES: usize = 10_000;
+
 /// Recursive descent parser for CEL expressions.
 pub struct Parser<'a> {
     tokens: &'a [SpannedToken],
@@ -29,6 +35,9 @@ pub struct Parser<'a> {
     macro_errors: Vec<ParseError>,
     /// Registry of macros for expansion.
     macros: MacroRegistry,
+    recursion_depth: usize,
+    /// Expanded subtree (depth, node count), including cloned occurrences.
+    ast_metrics: HashMap<i64, (usize, usize)>,
 }
 
 impl<'a> Parser<'a> {
@@ -46,6 +55,8 @@ impl<'a> Parser<'a> {
             macro_calls: HashMap::new(),
             macro_errors: Vec::new(),
             macros,
+            recursion_depth: 0,
+            ast_metrics: HashMap::new(),
         }
     }
 
@@ -142,9 +153,93 @@ impl<'a> Parser<'a> {
 
     // === Expression Parsing ===
 
+    /// Check each constructed subtree before it can be cloned, checked or
+    /// recursively dropped. Cached metrics keep long chains linear in size.
+    fn check_ast_limits(&mut self, expr: &SpannedExpr) -> Result<(), ParseError> {
+        let mut pending = vec![(expr, false)];
+        while let Some((expr, visited)) = pending.pop() {
+            if self.ast_metrics.contains_key(&expr.id) {
+                continue;
+            }
+            let children: Vec<&SpannedExpr> = match &expr.node {
+                Expr::List(elements) => elements.iter().map(|e| &e.expr).collect(),
+                Expr::Map(entries) => entries.iter().flat_map(|e| [&e.key, &e.value]).collect(),
+                Expr::Unary { expr, .. }
+                | Expr::Member { expr, .. }
+                | Expr::MemberTestOnly { expr, .. } => vec![expr],
+                Expr::Binary { left, right, .. } => vec![left, right],
+                Expr::Ternary {
+                    cond,
+                    then_expr,
+                    else_expr,
+                } => vec![cond, then_expr, else_expr],
+                Expr::Index { expr, index, .. } => vec![expr, index],
+                Expr::Call { expr, args } => std::iter::once(expr.as_ref()).chain(args).collect(),
+                Expr::Struct { type_name, fields } => std::iter::once(type_name.as_ref())
+                    .chain(fields.iter().map(|f| &f.value))
+                    .collect(),
+                Expr::Comprehension(comp) => vec![
+                    &comp.iter_range,
+                    &comp.accu_init,
+                    &comp.loop_condition,
+                    &comp.loop_step,
+                    &comp.result,
+                ],
+                Expr::Bind { init, body, .. } => vec![init, body],
+                Expr::Null
+                | Expr::Bool(_)
+                | Expr::Int(_)
+                | Expr::UInt(_)
+                | Expr::Float(_)
+                | Expr::String(_)
+                | Expr::Bytes(_)
+                | Expr::Ident(_)
+                | Expr::RootIdent(_)
+                | Expr::Error => Vec::new(),
+            };
+            if !visited {
+                pending.push((expr, true));
+                pending.extend(children.into_iter().map(|child| (child, false)));
+                continue;
+            }
+            let mut depth = 1;
+            let mut nodes = 1usize;
+            for child in children {
+                let (child_depth, child_nodes) = self.ast_metrics[&child.id];
+                depth = depth.max(child_depth + 1);
+                nodes = nodes.saturating_add(child_nodes);
+            }
+            if depth > MAX_AST_DEPTH || nodes > MAX_AST_NODES {
+                return Err(ParseError {
+                    message: if depth > MAX_AST_DEPTH {
+                        format!("expanded expression exceeds depth limit of {MAX_AST_DEPTH}")
+                    } else {
+                        format!("expanded expression exceeds node limit of {MAX_AST_NODES}")
+                    },
+                    span: expr.span.clone(),
+                });
+            }
+            self.ast_metrics.insert(expr.id, (depth, nodes));
+        }
+        Ok(())
+    }
+
     /// Parse an expression (entry point).
     pub fn parse_expr(&mut self) -> Result<SpannedExpr, ParseError> {
-        self.parse_ternary()
+        if self.recursion_depth == MAX_RECURSION_DEPTH {
+            return Err(ParseError {
+                message: format!(
+                    "expression exceeds parser nesting limit of {MAX_RECURSION_DEPTH}"
+                ),
+                span: self.peek_span(),
+            });
+        }
+        self.recursion_depth += 1;
+        let result = self.parse_ternary();
+        self.recursion_depth -= 1;
+        let expr = result?;
+        self.check_ast_limits(&expr)?;
+        Ok(expr)
     }
 
     /// Parse ternary conditional: expr ? expr : expr
@@ -189,6 +284,7 @@ impl<'a> Parser<'a> {
                 },
                 span,
             );
+            self.check_ast_limits(&left)?;
         }
 
         Ok(left)
@@ -212,6 +308,7 @@ impl<'a> Parser<'a> {
                 },
                 span,
             );
+            self.check_ast_limits(&left)?;
         }
 
         Ok(left)
@@ -234,6 +331,7 @@ impl<'a> Parser<'a> {
                 },
                 span,
             );
+            self.check_ast_limits(&left)?;
         }
 
         Ok(left)
@@ -281,6 +379,7 @@ impl<'a> Parser<'a> {
                 },
                 span,
             );
+            self.check_ast_limits(&left)?;
         }
 
         Ok(left)
@@ -314,6 +413,7 @@ impl<'a> Parser<'a> {
                 },
                 span,
             );
+            self.check_ast_limits(&left)?;
         }
 
         Ok(left)
@@ -323,51 +423,53 @@ impl<'a> Parser<'a> {
     fn parse_unary(&mut self) -> Result<SpannedExpr, ParseError> {
         use crate::types::UnaryOp;
 
-        let start = self.peek_span().start;
-
-        if self.match_token(&Token::Minus) {
-            // Special case: -9223372036854775808 is i64::MIN
-            // The literal 9223372036854775808 overflows i64, but -9223372036854775808 is valid
-            if let Some((Token::IntOverflow(s), span)) = self.peek_with_span() {
-                if s == "9223372036854775808" {
-                    let end = span.end;
-                    self.advance();
-                    return Ok(Spanned::new(
-                        self.next_id(),
-                        Expr::Int(i64::MIN),
-                        start..end,
-                    ));
+        let mut operators = Vec::new();
+        let mut expr = loop {
+            let start = self.peek_span().start;
+            let op = if self.match_token(&Token::Minus) {
+                // This magnitude is only valid as the literal i64::MIN.
+                if let Some((Token::IntOverflow(s), span)) = self.peek_with_span() {
+                    if s == "9223372036854775808" {
+                        let end = span.end;
+                        self.advance();
+                        break Spanned::new(self.next_id(), Expr::Int(i64::MIN), start..end);
+                    }
                 }
+                UnaryOp::Neg
+            } else if self.match_token(&Token::Not) {
+                UnaryOp::Not
+            } else {
+                break self.parse_postfix()?;
+            };
+            operators.push((op, start));
+            if operators.len() >= MAX_AST_DEPTH {
+                return Err(ParseError {
+                    message: format!("expanded expression exceeds depth limit of {MAX_AST_DEPTH}"),
+                    span: start..self.peek_span().start,
+                });
             }
-            let expr = self.parse_unary()?;
+        };
+
+        self.check_ast_limits(&expr)?;
+        for (op, start) in operators.into_iter().rev() {
             let span = start..expr.span.end;
-            Ok(Spanned::new(
+            expr = Spanned::new(
                 self.next_id(),
                 Expr::Unary {
-                    op: UnaryOp::Neg,
+                    op,
                     expr: Box::new(expr),
                 },
                 span,
-            ))
-        } else if self.match_token(&Token::Not) {
-            let expr = self.parse_unary()?;
-            let span = start..expr.span.end;
-            Ok(Spanned::new(
-                self.next_id(),
-                Expr::Unary {
-                    op: UnaryOp::Not,
-                    expr: Box::new(expr),
-                },
-                span,
-            ))
-        } else {
-            self.parse_postfix()
+            );
+            self.check_ast_limits(&expr)?;
         }
+        Ok(expr)
     }
 
     /// Parse postfix operators: . [] () {}
     fn parse_postfix(&mut self) -> Result<SpannedExpr, ParseError> {
         let mut expr = self.parse_atom()?;
+        self.check_ast_limits(&expr)?;
 
         loop {
             if self.check(&Token::LParen) {
@@ -385,6 +487,7 @@ impl<'a> Parser<'a> {
             } else {
                 break;
             }
+            self.check_ast_limits(&expr)?;
         }
 
         Ok(expr)
@@ -419,7 +522,7 @@ impl<'a> Parser<'a> {
         let span = start..end_span.end;
 
         // Try macro expansion using the registry
-        if let Some(expanded) = self.try_macro_expansion(&callee, span.clone(), args.clone()) {
+        if let Some(expanded) = self.try_macro_expansion(&callee, span.clone(), args.clone())? {
             return Ok(expanded);
         }
 
@@ -438,14 +541,17 @@ impl<'a> Parser<'a> {
     /// Returns None if no matching macro is found or if the macro doesn't apply.
     /// Returns Some(Expr::Error) if the macro name matches but expansion fails
     /// (wrong arity or expansion error), preventing misleading checker errors.
+    /// Resource limits abort parsing rather than producing a partial tree.
     fn try_macro_expansion(
         &mut self,
         callee: &SpannedExpr,
         span: Span,
         args: Vec<SpannedExpr>,
-    ) -> Option<SpannedExpr> {
+    ) -> Result<Option<SpannedExpr>, ParseError> {
         // Extract call info: (name, receiver, is_receiver)
-        let (name, receiver, is_receiver) = self.extract_call_info(callee)?;
+        let Some((name, receiver, is_receiver)) = self.extract_call_info(callee) else {
+            return Ok(None);
+        };
 
         // Look up macro in registry with actual arg count
         let macro_def = match self.macros.lookup(&name, args.len(), is_receiver) {
@@ -462,7 +568,7 @@ impl<'a> Parser<'a> {
                 );
                 let id = self.next_id;
                 self.next_id += 1;
-                return Some(Spanned::new(id, Expr::Error, span));
+                return Ok(Some(Spanned::new(id, Expr::Error, span)));
             }
         };
 
@@ -513,15 +619,16 @@ impl<'a> Parser<'a> {
             self.add_macro_error(message, error_span);
         }
 
-        match result {
+        Ok(match result {
             MacroExpansion::Expanded(expr) => Some(expr),
+            MacroExpansion::ResourceLimit(message) => return Err(ParseError { message, span }),
             MacroExpansion::Error(msg) => {
                 self.add_macro_error(msg, span.clone());
                 let id = self.next_id;
                 self.next_id += 1;
                 Some(Spanned::new(id, Expr::Error, span))
             }
-        }
+        })
     }
 
     /// Extract call information from a callee expression.

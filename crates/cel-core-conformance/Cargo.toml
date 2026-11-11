@@ -1,12 +1,13 @@
 [package]
 name = "cel-core-conformance"
-description = "CEL conformance testing against official cel-spec"
+description = "Inherited cel-spec conformance harness for Ryusen's CEL fork"
 publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+homepage.workspace = true
 
 [dependencies]
 cel-core.workspace = true

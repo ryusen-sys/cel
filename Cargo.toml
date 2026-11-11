@@ -8,7 +8,9 @@ version = "0.5.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ryusen-sys/cel"
-authors = ["ponix-dev"]
+homepage = "https://github.com/ryusen-sys/cel"
+readme = "README.md"
+authors = ["ponix-dev", "Ryusen contributors"]
 
 [workspace.dependencies]
 logos = "0.14"

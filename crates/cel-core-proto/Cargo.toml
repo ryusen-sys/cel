@@ -1,5 +1,7 @@
 [package]
 name = "cel-core-proto"
+# crates.io's cel-core packages belong to upstream; see docs/releasing.md.
+publish = false
 description = "Protobuf conversions for CEL ASTs and values (cel-spec compatibility), from Ryusen's fork of ponix-dev/cel-core"
 keywords = ["cel", "protobuf", "ast", "ryusen"]
 categories = ["encoding", "parsing"]

@@ -1,5 +1,7 @@
 [package]
 name = "cel-core"
+# crates.io's cel-core packages belong to upstream; see docs/releasing.md.
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true

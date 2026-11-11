@@ -37,8 +37,8 @@ impl Template {
         }
     }
 
-    fn anchor(&self, captured: &Value) -> Option<(&Path, Arc<str>)> {
-        self.guards.iter().find_map(|guard| {
+    fn anchors<'a>(&'a self, captured: &'a Value) -> impl Iterator<Item = (&'a Path, Arc<str>)> {
+        self.guards.iter().filter_map(move |guard| {
             let key = match &guard.expected {
                 Expected::Literal(key) => key.clone(),
                 Expected::Captured(path) => match read_path(captured, path)? {
@@ -162,7 +162,16 @@ pub struct GuardIndex {
 
 impl GuardIndex {
     pub fn insert(&mut self, id: u32, template: &Template, captured: &Value) {
-        let location = if let Some((path, key)) = template.anchor(captured) {
+        // Choose the smallest current posting, not the first syntactic guard.
+        // Equal lengths retain AST order. This is an insertion-time heuristic:
+        // postings count assigned anchors, not all guards or event frequency.
+        let anchor = template.anchors(captured).min_by_key(|(path, key)| {
+            self.path_ids
+                .get(*path)
+                .and_then(|&id| self.paths[id].postings.get(key))
+                .map_or(0, Vec::len)
+        });
+        let location = if let Some((path, key)) = anchor {
             let path_id = *self.path_ids.entry(path.clone()).or_insert_with(|| {
                 self.paths.push(PathIndex {
                     path: path.clone(),

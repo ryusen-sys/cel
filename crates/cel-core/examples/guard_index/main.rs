@@ -155,22 +155,26 @@ const WORKLOADS: [Workload; 7] = [
     },
 ];
 
-fn templates() -> Vec<Template> {
+fn templates(unwrapped_residuals: bool) -> Vec<Template> {
     let env = environment();
-    template_sources()
+    template_sources(unwrapped_residuals)
         .iter()
         .map(|source| Template::compile(&env, source))
         .collect()
 }
 
-fn template_sources() -> Vec<String> {
+fn template_sources(unwrapped_residuals: bool) -> Vec<String> {
     [false, true]
         .into_iter()
         .flat_map(|opaque| {
             corpus::PREDICATES.iter().enumerate().flat_map(move |(variant, (_, predicate))| {
-                // Keep residual-only guards out of the controlled anchor
-                // distribution without replacing their CEL evaluation.
-                let predicate = format!("!!({predicate})");
+                // Default controls isolate correlation guards. The unwrapped
+                // mode exposes residual guards to measure anchor selection.
+                let predicate = if unwrapped_residuals {
+                    (*predicate).to_owned()
+                } else {
+                    format!("!!({predicate})")
+                };
                 FIELDS.iter().map(move |field| {
                     let equality = if opaque {
                         match variant % 4 {
@@ -284,10 +288,10 @@ fn percentile(values: &[u128], percent: usize) -> u128 {
     sorted[(sorted.len() * percent).div_ceil(100).saturating_sub(1)]
 }
 
-fn run(workload: Workload, count: usize, event_count: usize, seed: u64) {
+fn run(workload: Workload, count: usize, event_count: usize, seed: u64, unwrapped_residuals: bool) {
     let mut random = Random(seed);
     let started = Instant::now();
-    let templates = templates();
+    let templates = templates(unwrapped_residuals);
     let registrations = registrations(count, workload, &mut random);
     let events = events(event_count, workload, &registrations, &mut random);
     let mut used = vec![false; templates.len()];
@@ -308,7 +312,7 @@ fn run(workload: Workload, count: usize, event_count: usize, seed: u64) {
     }
     let build = started.elapsed();
     println!(
-        "{{\"record\":\"setup\",\"workload\":\"{}\",\"registrations\":{count},\"templates\":{},\"used_programs\":{used_programs},\"predicate_families\":{},\"events\":{event_count},\"seed\":{seed},\"preparation_ns\":{},\"index_build_ns\":{},\"rss_before_index_kib\":{base_rss},\"rss_with_index_kib\":{},\"unindexed\":{},\"paths\":{},\"concurrency\":1}}",
+        "{{\"record\":\"setup\",\"workload\":\"{}\",\"unwrapped_residuals\":{unwrapped_residuals},\"registrations\":{count},\"templates\":{},\"used_programs\":{used_programs},\"predicate_families\":{},\"events\":{event_count},\"seed\":{seed},\"preparation_ns\":{},\"index_build_ns\":{},\"rss_before_index_kib\":{base_rss},\"rss_with_index_kib\":{},\"unindexed\":{},\"paths\":{},\"concurrency\":1}}",
         workload.name, templates.len(), corpus::PREDICATES.len(), preparation.as_nanos(), build.as_nanos(), rss_kib(), index.unindexed_count(), index.path_count(),
     );
 
@@ -410,6 +414,7 @@ fn main() {
     let mut event_count = 24;
     let mut seed = SEED;
     let mut workload = "selective".to_owned();
+    let mut unwrapped_residuals = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -417,8 +422,9 @@ fn main() {
             "--events" => event_count = args.next().unwrap().parse().unwrap(),
             "--seed" => seed = args.next().unwrap().parse().unwrap(),
             "--workload" => workload = args.next().unwrap(),
+            "--unwrapped-residuals" => unwrapped_residuals = true,
             "--list-templates" => {
-                for (id, source) in template_sources().iter().enumerate() {
+                for (id, source) in template_sources(unwrapped_residuals).iter().enumerate() {
                     let family =
                         corpus::PREDICATES[(id / FIELDS.len()) % corpus::PREDICATES.len()].0;
                     println!("{id}\t{family}\t{source}");
@@ -426,7 +432,7 @@ fn main() {
                 return;
             }
             "--help" => {
-                println!("guard_index [--registrations 1000000] [--events 24] [--seed {SEED}] [--workload NAME] [--list-templates]\nWorkloads: {}\nLinux RSS measurement; release build; one process/thread; NDJSON on stdout.", WORKLOADS.map(|w| w.name).join(", "));
+                println!("guard_index [--registrations 1000000] [--events 24] [--seed {SEED}] [--workload NAME] [--unwrapped-residuals] [--list-templates]\nWorkloads: {}\nLinux RSS measurement; release build; one process/thread; NDJSON on stdout.\nUnwrapped residuals expose additional guards; fallback populations no longer match the controlled workload labels. Put this flag before --list-templates to list unwrapped sources.", WORKLOADS.map(|w| w.name).join(", "));
                 return;
             }
             _ => panic!("unknown argument {arg}"),
@@ -438,7 +444,7 @@ fn main() {
         .into_iter()
         .find(|candidate| candidate.name == workload)
         .expect("unknown workload");
-    run(workload, count, event_count, seed);
+    run(workload, count, event_count, seed, unwrapped_residuals);
 }
 
 #[cfg(test)]
@@ -447,8 +453,6 @@ mod tests {
 
     #[test]
     fn diverse_corpus_checks_and_executes_every_program() {
-        let templates = templates();
-        let sources = template_sources();
         let captured = envelope(
             FIELDS
                 .into_iter()
@@ -460,22 +464,26 @@ mod tests {
                 .into_iter()
                 .map(|field| (field.to_owned(), "x".into())),
         );
-        for (id, template) in templates.iter().enumerate() {
-            let value = template.program.eval(&Bindings {
-                captured: &captured,
-                incoming: &incoming,
-            });
-            assert!(
-                matches!(value, Value::Bool(true)),
-                "{}: {value:?}",
-                sources[id]
-            );
+        for unwrapped in [false, true] {
+            let templates = templates(unwrapped);
+            let sources = template_sources(unwrapped);
+            for (id, template) in templates.iter().enumerate() {
+                let value = template.program.eval(&Bindings {
+                    captured: &captured,
+                    incoming: &incoming,
+                });
+                assert!(
+                    matches!(value, Value::Bool(true)),
+                    "{}: {value:?}",
+                    sources[id]
+                );
+            }
         }
     }
 
     #[test]
     fn benchmark_controls_have_exact_fallback_populations_and_misses() {
-        let templates = templates();
+        let templates = templates(false);
         let incoming = corpus::incoming(
             FIELDS
                 .into_iter()
@@ -559,7 +567,9 @@ mod tests {
         ];
         let (matches, calls) = compare(&sources, &captured, &incoming);
         assert_eq!(matches, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 11]);
-        assert_eq!(calls, sources.len() - 1);
+        // Both required key equalities miss. The second now uses its sparse
+        // key posting rather than the already populated other == 'y' posting.
+        assert_eq!(calls, sources.len() - 2);
         for incoming in [
             envelope([]),
             envelope([("key".into(), Value::Null)]),
@@ -571,7 +581,7 @@ mod tests {
 
     #[test]
     fn seeded_match_sets_survive_removal_rebinding_and_slot_reuse() {
-        let templates = templates();
+        let templates = templates(false);
         let workload = WORKLOADS[3];
         let mut random = Random(SEED);
         let mut registrations = registrations(512, workload, &mut random);
@@ -637,5 +647,53 @@ mod tests {
             indexed.matches.sort_unstable();
             assert_eq!(scan.matches, indexed.matches);
         }
+    }
+
+    #[test]
+    fn anchor_selection_uses_live_posting_lengths_and_reconsiders_on_reinsertion() {
+        let env = environment();
+        let broad = Template::compile(&env, "async.data.other == 'y'");
+        let key_only = Template::compile(&env, "async.data.key == event.data.key");
+        let combined = Template::compile(
+            &env,
+            "async.data.other == 'y' && async.data.key == event.data.key",
+        );
+        let captured = envelope([("key".into(), "target".into())]);
+        let miss = envelope([
+            ("other".into(), "y".into()),
+            ("key".into(), "absent".into()),
+        ]);
+        let hit = envelope([
+            ("other".into(), "y".into()),
+            ("key".into(), "target".into()),
+        ]);
+        let mut index = GuardIndex::default();
+        for id in 0..4 {
+            index.insert(id, &broad, &captured);
+        }
+        for id in 4..6 {
+            index.insert(id, &key_only, &captured);
+        }
+        index.insert(6, &combined, &captured);
+        assert_eq!(index.candidates(&miss), vec![0, 1, 2, 3]);
+        let mut candidates = index.candidates(&hit);
+        candidates.sort_unstable();
+        assert_eq!(candidates, vec![0, 1, 2, 3, 4, 5, 6]);
+
+        // Empty postings must stop influencing the choice. Reinsert rather
+        // than silently rebalancing existing registrations; ties use AST order.
+        for id in 0..7 {
+            index.remove(id);
+        }
+        index.insert(6, &combined, &captured);
+        assert_eq!(index.candidates(&miss), vec![6]);
+        assert_eq!(index.candidates(&hit), vec![6]);
+        assert!(matches!(
+            combined.program.eval(&Bindings {
+                captured: &captured,
+                incoming: &miss
+            }),
+            Value::Bool(false)
+        ));
     }
 }

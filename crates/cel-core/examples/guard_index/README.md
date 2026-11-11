@@ -37,10 +37,12 @@ in both routes; the revised workload is not identical to the original baseline.
 
 Residual Booleans are wrapped in `!!(...)` so only the intended correlation
 guards determine these controlled populations. Their complete CEL evaluation
-remains in both routes. The property generators retain unwrapped residuals.
-Without this isolation, the first-usable-anchor policy can choose a broad
-literal guard before a selective correlation guard; these latency measurements
-do not establish selectivity-aware anchor choice.
+remains in both routes. Add `--unwrapped-residuals` to expose residual guards
+as well, including the broad `name == 'order-paid'` and `labels['tier'] == 'gold'`
+guards. This mode measures anchor choice without isolating the correlation
+guard; its actual fallback populations can differ from the table above and are
+reported in the setup record. Put the flag before `--list-templates` to print
+the unwrapped sources. Property/fuzz generators also retain unwrapped residuals.
 
 ## What is being compared
 
@@ -86,9 +88,19 @@ event is an intentional miss, except in the all-match control.
 The planner walks the checked AST, flattening only top-level AND. It recognizes
 required string equalities between a static `async` field path and a decoded CEL
 string literal or a captured `event` field path, including reversed equality and
-string-key indexing. Each registration chooses its first usable guard as one
-anchor; complete CEL confirmation checks every remaining conjunct. There is no
-global registration scan or million-entry visited bitmap in candidate selection.
+string-key indexing. Each registration chooses the usable guard with the fewest
+currently assigned anchors in its posting list; ties retain AST order. This
+insertion-time heuristic replaces first-usable-guard selection without adding
+another frequency table. It counts indexed anchors, not all guard occurrences
+or incoming event frequencies, so it is not an optimal selectivity estimate.
+Existing registrations do not rebalance when populations change; removal and
+reinsertion reconsider the choice using current counts.
+
+One anchor remains sufficient for conservative pruning: a true expression must
+satisfy every extracted equality, whichever one is chosen. Complete CEL
+confirmation checks every remaining conjunct. There is no global registration
+scan or million-entry visited bitmap in candidate selection, and no posting-list
+intersection or extra index entry per guard.
 
 OR, NOT, macros, computed paths, numeric/null/aggregate keys and unsupported
 operations stay ordinary CEL. No suitable guard means an unindexed registration,
@@ -140,12 +152,13 @@ currently rejects nested `dyn` bracket access (`async['data']['key']`) and infer
 two-`dyn` division incorrectly in `async.data.amount / async.data.scale > 0`.
 The corpus uses supported single-level bracket access and explicit numeric casts
 where needed; it does not classify those rejection bugs as CEL incompatibility
-introduced by the index. Parser fuzz inputs stop at 512 bytes and generated trees
-at three recursive levels. Neither limit proves parser depth safety or execution
-budget enforcement.
+introduced by the index. Structured fuzz inputs stop at 768 bytes and generated
+trees at three recursive levels; these campaigns are not exhaustive.
 
 Match-set preservation is not preservation of error logs for skipped programs.
-The existing engine's semantic/safety gaps remain. Native budgets, allocation
-limits, strict CEL conformance and publication policy still require the hardening
-work described in the CEL scope document. This prototype does not make those
-problems disappear, and dense or unindexed populations still require linear work.
+Source compilation now has size/depth ceilings and native evaluation offers
+opt-in fuel/logical allocation limits; see the root README for their boundaries.
+This benchmark still uses unbounded `eval` with trusted generated data, not the
+bounded API. Strict CEL conformance and publication policy remain separate work.
+This prototype does not establish a complete runtime sandbox, and dense or
+unindexed populations still require linear work.

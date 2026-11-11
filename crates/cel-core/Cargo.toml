@@ -1,11 +1,17 @@
 [package]
 name = "cel-core"
+# crates.io's cel-core packages belong to upstream; see docs/releasing.md.
+publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "High-level API for the Common Expression Language (CEL)"
+homepage.workspace = true
+readme.workspace = true
+description = "Ryusen's fork of ponix-dev/cel-core: parse, type-check and evaluate Common Expression Language (CEL) expressions"
+keywords = ["cel", "expression", "evaluator", "policy", "ryusen"]
+categories = ["parser-implementations", "compilers"]
 
 [dependencies]
 chrono = "0.4"

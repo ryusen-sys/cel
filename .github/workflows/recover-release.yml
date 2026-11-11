@@ -19,7 +19,7 @@ jobs:
   validate-release:
     name: Validate recovery request
     if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     outputs:
       release_commit: ${{ steps.release.outputs.commit }}
     steps:
@@ -74,7 +74,7 @@ jobs:
   create-tag:
     name: Create recovered release tag
     needs: [validate-release, dry-run-release]
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     environment: RELEASE
     steps:
       - name: Create chaba2-bot token

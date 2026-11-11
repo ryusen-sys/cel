@@ -14,7 +14,7 @@ concurrency:
 jobs:
   tag-release:
     if: github.event.pull_request.merged == true && github.event.pull_request.head.ref == 'release/next' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.ref == github.event.repository.default_branch
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     environment: RELEASE
     outputs:
       release_commit: ${{ steps.release.outputs.commit }}

@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   create-release-pr:
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     environment: RELEASE
     outputs:
       release_commit: ${{ steps.release-branch.outputs.commit }}
@@ -266,7 +266,7 @@ jobs:
     name: Report release build result
     needs: [create-release-pr, dry-run-release]
     if: always() && needs.create-release-pr.outputs.release_commit != ''
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     environment: RELEASE
     steps:
       - name: Create chaba2-bot token

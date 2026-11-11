@@ -56,8 +56,8 @@ downloading action. Package and version checks are exercised by `make check`.
 
 Before merging or enabling release workflows, an administrator must configure:
 
-- GitHub Actions enabled, the pinned external actions allowed, and the org's
-  `blacksmith-2vcpu-ubuntu-2404` runner available to this repository.
+- GitHub Actions enabled and the pinned external actions allowed. Every job
+  runs on GitHub-hosted `ubuntu-24.04` runners; no self-hosted runner is needed.
 - Squash-only merging using PR titles; protect `main` and require `Validate title`,
   `Check`, `Upstream conformance harness`, `Nix build` and `Differential fuzz smoke`
   checks.

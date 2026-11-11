@@ -15,7 +15,7 @@ test:
 	cargo test -p cel-core --doc --locked
 
 check-workflows:
-	actionlint -config-file .github/actionlint.yaml .github/workflows/*.yml
+	actionlint .github/workflows/*.yml
 	shellcheck scripts/git-with-token.sh scripts/verify-release-tag.sh scripts/verify-release-status.sh scripts/package-release.sh
 	python3 scripts/check-release.py
 

@@ -88,6 +88,7 @@ pub fn check(source: &str, data: &[u8]) {
         format!("({source}) && ('a' == async.data.other)"),
         format!("async.data.key == event.data.key || ({source})"),
         "async.data.key == event.data.key".to_owned(),
+        "async.data.key == event.data.key && async.data.other == 'a'".to_owned(),
     ];
     let templates: Vec<_> = sources
         .iter()
@@ -106,6 +107,7 @@ pub fn check(source: &str, data: &[u8]) {
         .collect();
     // Keep a guaranteed well-typed, positive control alongside malformed data.
     model[0] = Some((4, corpus::incoming([("key".into(), "a".into())])));
+    model[1] = Some((5, corpus::incoming([("key".into(), "a".into())])));
     let mut index = GuardIndex::default();
     for (id, registration) in model.iter().enumerate() {
         let (template, captured) = registration.as_ref().unwrap();
@@ -140,7 +142,14 @@ pub fn check(source: &str, data: &[u8]) {
             let expected: Vec<_> = (0..model.len() as u32)
                 .filter(|&id| model[id as usize].is_some() && evaluate(id))
                 .collect();
-            let actual: Vec<_> = candidates.into_iter().filter(|&id| evaluate(id)).collect();
+            let actual: Vec<_> = candidates
+                .into_iter()
+                .filter(|&id| {
+                    let (template, captured) = model[id as usize].as_ref().unwrap();
+                    templates[*template].may_match(captured, incoming)
+                })
+                .filter(|&id| evaluate(id))
+                .collect();
             assert_eq!(
                 actual, expected,
                 "source={source}, step={step}, event={incoming:?}, model={model:?}"

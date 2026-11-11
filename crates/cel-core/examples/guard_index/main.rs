@@ -94,6 +94,18 @@ fn evaluate(
     black_box(result)
 }
 
+fn secondary_candidates<'a>(
+    templates: &'a [Template],
+    registrations: &'a [Registration],
+    incoming: &'a Value,
+    ids: impl Iterator<Item = u32> + 'a,
+) -> impl Iterator<Item = u32> + 'a {
+    ids.filter(move |&id| {
+        let registration = &registrations[id as usize];
+        templates[registration.template].may_match(&registration.captured, incoming)
+    })
+}
+
 #[derive(Clone, Copy)]
 struct Workload {
     name: &'static str,
@@ -322,7 +334,12 @@ fn run(workload: Workload, count: usize, event_count: usize, seed: u64, unwrappe
         &templates,
         &registrations,
         &events[0],
-        index.candidates(&events[0]).into_iter(),
+        secondary_candidates(
+            &templates,
+            &registrations,
+            &events[0],
+            index.candidates(&events[0]).into_iter(),
+        ),
     );
     warm_indexed.matches.sort_unstable();
     assert_eq!(warm_scan.matches, warm_indexed.matches);
@@ -331,6 +348,7 @@ fn run(workload: Workload, count: usize, event_count: usize, seed: u64, unwrappe
     let mut indexed_times = Vec::new();
     let mut selection_times = Vec::new();
     let mut candidate_counts = Vec::new();
+    let mut cel_calls = 0;
     for (event_id, event) in events.iter().enumerate() {
         let scan = || {
             let start = Instant::now();
@@ -340,19 +358,27 @@ fn run(workload: Workload, count: usize, event_count: usize, seed: u64, unwrappe
         let indexed = || {
             let start = Instant::now();
             let candidates = index.candidates(event);
+            let candidate_count = candidates.len();
             let selection = start.elapsed();
-            let result = evaluate(&templates, &registrations, event, candidates.into_iter());
-            (start.elapsed(), selection, result)
+            let result = evaluate(
+                &templates,
+                &registrations,
+                event,
+                secondary_candidates(&templates, &registrations, event, candidates.into_iter()),
+            );
+            (start.elapsed(), selection, candidate_count, result)
         };
         // Alternate ordering to avoid always giving one route the warmer cache.
-        let ((scan_time, scan_result), (index_time, selection, mut indexed_result)) =
-            if event_id % 2 == 0 {
-                let scan_result = scan();
-                (scan_result, indexed())
-            } else {
-                let index_result = indexed();
-                (scan(), index_result)
-            };
+        let (
+            (scan_time, scan_result),
+            (index_time, selection, candidate_count, mut indexed_result),
+        ) = if event_id % 2 == 0 {
+            let scan_result = scan();
+            (scan_result, indexed())
+        } else {
+            let index_result = indexed();
+            (scan(), index_result)
+        };
         // Set comparison is outside both timers. No expression is removed from
         // CEL or replaced by a hand-coded residual in either route.
         indexed_result.matches.sort_unstable();
@@ -367,13 +393,14 @@ fn run(workload: Workload, count: usize, event_count: usize, seed: u64, unwrappe
             assert_eq!(scan_result.matches.len(), count);
         }
         println!(
-            "{{\"record\":\"event\",\"workload\":\"{}\",\"event\":{event_id},\"scan_ns\":{},\"indexed_ns\":{},\"selection_ns\":{},\"scan_calls\":{},\"indexed_calls\":{},\"matches\":{},\"match_sets_equal\":true}}",
-            workload.name, scan_time.as_nanos(), index_time.as_nanos(), selection.as_nanos(), scan_result.calls, indexed_result.calls, scan_result.matches.len(),
+            "{{\"record\":\"event\",\"workload\":\"{}\",\"event\":{event_id},\"scan_ns\":{},\"indexed_ns\":{},\"selection_ns\":{},\"candidates\":{candidate_count},\"guard_rejections\":{},\"scan_calls\":{},\"indexed_calls\":{},\"matches\":{},\"match_sets_equal\":true}}",
+            workload.name, scan_time.as_nanos(), index_time.as_nanos(), selection.as_nanos(), candidate_count - indexed_result.calls, scan_result.calls, indexed_result.calls, scan_result.matches.len(),
         );
         scan_times.push(scan_time.as_nanos());
         indexed_times.push(index_time.as_nanos());
         selection_times.push(selection.as_nanos());
-        candidate_counts.push(indexed_result.calls as u128);
+        candidate_counts.push(candidate_count as u128);
+        cel_calls += indexed_result.calls;
     }
 
     let churn_count = count.min(10_000);
@@ -395,7 +422,12 @@ fn run(workload: Workload, count: usize, event_count: usize, seed: u64, unwrappe
             &templates,
             &registrations,
             event,
-            index.candidates(event).into_iter(),
+            secondary_candidates(
+                &templates,
+                &registrations,
+                event,
+                index.candidates(event).into_iter(),
+            ),
         );
         indexed.matches.sort_unstable();
         assert_eq!(scan.matches, indexed.matches, "after churn");
@@ -404,8 +436,8 @@ fn run(workload: Workload, count: usize, event_count: usize, seed: u64, unwrappe
     let indexed_total: u128 = indexed_times.iter().sum();
     let candidates: u128 = candidate_counts.iter().sum();
     println!(
-        "{{\"record\":\"summary\",\"workload\":\"{}\",\"registrations\":{count},\"events\":{event_count},\"scan_p50_ns\":{},\"scan_p95_ns\":{},\"indexed_p50_ns\":{},\"indexed_p95_ns\":{},\"selection_p50_ns\":{},\"selection_p95_ns\":{},\"mean_candidates\":{},\"max_candidates\":{},\"skipped_fraction\":{},\"total_time_speedup\":{},\"churn_pairs\":{churn_count},\"churn_ns\":{},\"all_match_sets_equal\":true}}",
-        workload.name, percentile(&scan_times, 50), percentile(&scan_times, 95), percentile(&indexed_times, 50), percentile(&indexed_times, 95), percentile(&selection_times, 50), percentile(&selection_times, 95), candidates as f64 / event_count as f64, candidate_counts.iter().max().unwrap(), 1.0 - candidates as f64 / (count * event_count) as f64, scan_total as f64 / indexed_total as f64, churn.as_nanos(),
+        "{{\"record\":\"summary\",\"workload\":\"{}\",\"registrations\":{count},\"events\":{event_count},\"scan_p50_ns\":{},\"scan_p95_ns\":{},\"indexed_p50_ns\":{},\"indexed_p95_ns\":{},\"selection_p50_ns\":{},\"selection_p95_ns\":{},\"mean_candidates\":{},\"mean_cel_calls\":{},\"max_candidates\":{},\"skipped_fraction\":{},\"total_time_speedup\":{},\"churn_pairs\":{churn_count},\"churn_ns\":{},\"all_match_sets_equal\":true}}",
+        workload.name, percentile(&scan_times, 50), percentile(&scan_times, 95), percentile(&indexed_times, 50), percentile(&indexed_times, 95), percentile(&selection_times, 50), percentile(&selection_times, 95), candidates as f64 / event_count as f64, cel_calls as f64 / event_count as f64, candidate_counts.iter().max().unwrap(), 1.0 - cel_calls as f64 / (count * event_count) as f64, scan_total as f64 / indexed_total as f64, churn.as_nanos(),
     );
 }
 
@@ -535,7 +567,12 @@ mod tests {
             0..sources.len() as u32,
         );
         let candidates = index.candidates(incoming);
-        let mut indexed = evaluate(&templates, &registrations, incoming, candidates.into_iter());
+        let mut indexed = evaluate(
+            &templates,
+            &registrations,
+            incoming,
+            secondary_candidates(&templates, &registrations, incoming, candidates.into_iter()),
+        );
         indexed.matches.sort_unstable();
         assert_eq!(scan.matches, indexed.matches);
         (scan.matches, indexed.calls)
@@ -580,6 +617,52 @@ mod tests {
     }
 
     #[test]
+    fn secondary_guards_reject_definite_misses_without_entering_opaque_scopes() {
+        let sources = [
+            "async.data.other == 'paid' && async.data.key == event.data.key",
+            "async.data.other == 'paid' && (async.data.key == event.data.key || true)",
+            "async.data.other == 'paid' && [{'data': {'key': 'local'}}].all(async, async.data.key == 'local')",
+        ];
+        let captured = envelope([("key".into(), "wanted".into())]);
+        let incoming = |key| envelope([("other".into(), "paid".into()), ("key".into(), key)]);
+        assert_eq!(
+            compare(&sources, &captured, &incoming("other".into())),
+            (vec![1, 2], 2)
+        );
+        assert_eq!(
+            compare(&sources, &captured, &incoming("wanted".into())),
+            (vec![0, 1, 2], 3)
+        );
+
+        // Unknown/non-string paths must reach CEL, not become a false match
+        // or an unsound rejection based on a macro-local or OR-only guard.
+        for value in [Value::Null, Value::Int(3), Value::map([("key", "wanted")])] {
+            assert_eq!(
+                compare(&sources, &captured, &incoming(value)),
+                (vec![1, 2], 3)
+            );
+        }
+        let missing = envelope([("other".into(), "paid".into())]);
+        assert_eq!(compare(&sources, &captured, &missing), (vec![1, 2], 3));
+        let non_string_capture = envelope([("key".into(), Value::Int(3))]);
+        assert_eq!(
+            compare(&sources, &non_string_capture, &incoming("other".into())),
+            (vec![1, 2], 3)
+        );
+
+        let reversed_literal = ["async.data.key == event.data.key && 'paid' == async.data.other"];
+        let unpaid = envelope([
+            ("key".into(), "wanted".into()),
+            ("other".into(), "unpaid".into()),
+        ]);
+        assert_eq!(compare(&reversed_literal, &captured, &unpaid), (vec![], 0));
+        assert_eq!(
+            compare(&reversed_literal, &captured, &incoming("wanted".into())),
+            (vec![0], 1)
+        );
+    }
+
+    #[test]
     fn seeded_match_sets_survive_removal_rebinding_and_slot_reuse() {
         let templates = templates(false);
         let workload = WORKLOADS[3];
@@ -612,7 +695,12 @@ mod tests {
                     &templates,
                     &registrations,
                     event,
-                    index.candidates(event).into_iter(),
+                    secondary_candidates(
+                        &templates,
+                        &registrations,
+                        event,
+                        index.candidates(event).into_iter(),
+                    ),
                 );
                 indexed.matches.sort_unstable();
                 assert_eq!(scan.matches, indexed.matches);
@@ -643,7 +731,12 @@ mod tests {
             unique.sort_unstable();
             unique.dedup();
             assert_eq!(unique.len(), candidates.len());
-            let mut indexed = evaluate(&templates, &registrations, event, candidates.into_iter());
+            let mut indexed = evaluate(
+                &templates,
+                &registrations,
+                event,
+                secondary_candidates(&templates, &registrations, event, candidates.into_iter()),
+            );
             indexed.matches.sort_unstable();
             assert_eq!(scan.matches, indexed.matches);
         }

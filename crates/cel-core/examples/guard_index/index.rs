@@ -37,6 +37,18 @@ impl Template {
         }
     }
 
+    pub fn may_match(&self, captured: &Value, incoming: &Value) -> bool {
+        // A single usable guard was already proved by the selected anchor.
+        // Unusable guards and unsupported incoming values remain may-match.
+        self.guards.len() <= 1
+            || self
+                .anchors(captured)
+                .all(|(path, expected)| match read_path(incoming, path) {
+                    Some(Value::String(actual)) => actual == &expected,
+                    _ => true,
+                })
+    }
+
     fn anchors<'a>(&'a self, captured: &'a Value) -> impl Iterator<Item = (&'a Path, Arc<str>)> {
         self.guards.iter().filter_map(move |guard| {
             let key = match &guard.expected {

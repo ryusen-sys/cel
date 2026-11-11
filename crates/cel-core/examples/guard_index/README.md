@@ -71,12 +71,18 @@ forces every used residual to execute.
 
 The full scan evaluates the original CEL program for every registration. The
 indexed route extracts each indexed incoming path once, fetches candidate IDs,
-adds all unindexed registrations, then evaluates the **same complete CEL program**
-for every candidate. It does not replace the residual with Rust code. Both routes
-use the same activation implementation and collect matching IDs. Every measured
-event asserts exact match-set equality outside the timers.
+adds all unindexed registrations, then rejects definite string mismatches using
+the template's extracted required guards and original captured values. Survivors
+execute the **same complete CEL program**. This does not replace residual CEL
+with Rust code. Both routes use the same activation implementation and collect
+matching IDs. Every measured event asserts exact match-set equality outside the
+timers.
 
-Candidate selection plus CEL confirmation is timed end to end. Parsing,
+Candidate selection, secondary filtering and CEL confirmation are timed end to end.
+`selection_ns` covers the initial posting lookup, not the lazy secondary checks.
+Event records distinguish raw `candidates`, `guard_rejections` and `indexed_calls`
+(full CEL calls). Summaries retain `mean_candidates` and add `mean_cel_calls`;
+`skipped_fraction` measures skipped full CEL calls, not rejected posting IDs. Parsing,
 registration/index construction, warm-up and result-set canonicalization are
 outside those timers. Build time and RSS before/after index construction are
 reported separately. Route order alternates. Percentiles are nearest-rank sample
@@ -97,10 +103,20 @@ Existing registrations do not rebalance when populations change; removal and
 reinsertion reconsider the choice using current counts.
 
 One anchor remains sufficient for conservative pruning: a true expression must
-satisfy every extracted equality, whichever one is chosen. Complete CEL
-confirmation checks every remaining conjunct. There is no global registration
-scan or million-entry visited bitmap in candidate selection, and no posting-list
-intersection or extra index entry per guard.
+satisfy every extracted equality, whichever one is chosen. For templates with
+multiple extracted guards, secondary filtering compares usable string expectations
+with incoming strings and rejects a candidate only on a definite mismatch.
+Missing, non-string and unsupported paths remain may-match and reach CEL. A
+single extracted guard needs no recheck because its anchor already established
+it; an unusable captured value keeps that guard opaque.
+
+The filter reads the existing shared template and captured values lazily. It
+stores no additional per-registration guards, copies no residual expression and
+does not allocate another candidate vector. Complete CEL confirmation still
+checks every surviving program. There is no global registration scan or
+million-entry visited bitmap in candidate selection, and no posting-list
+intersection or extra index entry per guard. Hot true matches and non-extracted
+residuals still require CEL work; this is not a solution to all hot-key costs.
 
 OR, NOT, macros, computed paths, numeric/null/aggregate keys and unsupported
 operations stay ordinary CEL. No suitable guard means an unindexed registration,
